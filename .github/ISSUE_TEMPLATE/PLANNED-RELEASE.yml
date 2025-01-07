@@ -1,0 +1,30 @@
+name: Planned Release
+description: Create an issue for a proposed feature
+title: <title>
+labels:
+  - release
+projects:
+  - Ed-Fi-Alliance-OSS/1
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Product Goal
+      description: Describe the overarching goal(s) for the given release.
+    validations:
+      required: true
+  - type: textarea
+    id: features
+    attributes:
+      label: Feature List
+      description: Describe the expected features or epics. Ideally, this is in the form of issue links using `#IssueNumber`.
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        ☝️ After creating this issue, immediately edit:
+        
+        1. Add a label for the portfolio: `data-standard`, `ods-api-platform`, `dms-platform`, `data-mgmt-tools`.
+        2. Add a milestone, which will be the expected calendar year _quarter_ for delivery.
+        3. (Optional) add a tentative date for completion.

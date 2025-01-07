@@ -1,0 +1,37 @@
+name: Proposed Feature
+description: Create an issue for a proposed feature
+title: <title>
+labels:
+  - feature
+projects:
+  - Ed-Fi-Alliance-OSS/2
+body:
+  - type: textarea
+    id: background
+    attributes:
+      label: Background
+      description: Provide background context for the proposal.
+    validations:
+      required: true
+  - type: textarea
+    id: opportunity
+    attributes:
+      label: Opportunity
+      description: Describe the opportunity for making a change in this context. Ideally write a _user story_ or a _job story_.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the current idea for achieving this opportunity.
+  - type: textarea
+    id: implementation
+    attributes:
+      label: Implementation Notes
+      description: Describe any thoughts you already have on implementing the proposal.
+  - type: markdown
+    attributes:
+      value: |
+        ☝️ After creating this issue, immediately edit and add a label for the portfolio:
+        `data-standard`, `ods-api-platform`, `dms-platform`, `data-mgmt-tools`.
