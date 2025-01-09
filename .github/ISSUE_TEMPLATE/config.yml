@@ -3,6 +3,3 @@ contact_links:
   - name: Ed-Fi Community Hub
     url: https://success.ed-fi.org
     about: Feature and support requests must go to the Community Hub.
-  - name: Repository Vulnerability Reporting
-    url: https://github.com/Ed-Fi-Alliance-OSS/Ed-Fi-Technology-Roadmap/security
-    about: Secure vulnerability report submission.
