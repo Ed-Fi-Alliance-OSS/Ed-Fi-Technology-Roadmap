@@ -1,6 +1,5 @@
 name: Planned Release
-description: Create an issue for a proposed feature
-title: <title>
+description: Create an issue for a planned product release. *For staff only*.
 labels:
   - release
 projects:
@@ -24,7 +23,7 @@ body:
     attributes:
       value: |
         ☝️ After creating this issue, immediately edit:
-        
+
         1. Add a label for the portfolio: `data-standard`, `ods-api-platform`, `dms-platform`, `data-mgmt-tools`.
         2. Add a milestone, which will be the expected calendar year _quarter_ for delivery.
         3. (Optional) add a tentative date for completion.

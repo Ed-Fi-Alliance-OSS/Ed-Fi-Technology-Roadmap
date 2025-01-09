@@ -1,6 +1,5 @@
 name: Proposed Feature
-description: Create an issue for a proposed feature
-title: <title>
+description: Create an issue for a proposed feature. *General public should use the Community Hub*.
 labels:
   - feature
 projects:
