@@ -32,7 +32,11 @@ This design establishes a dual-backlog system:
 
 ### Where GitHub Issues will live
 
-To be decided: either centralized in this `Technology-Roadmap` repository or distributed across individual product repositories. The design works in either location.
+All GitHub Issues are centralized in the `Ed-Fi-Technology-Roadmap` repository. This provides a single collection point for community-facing visibility and, when the time comes, for community-submitted issues.
+
+**Future consideration:** After triage, staff may copy an issue from `Ed-Fi-Technology-Roadmap` into the relevant product-specific repository (e.g., `Ed-Fi-ODS`) to keep it close to the code. This option is not exercised at launch but is available without changes to the automation design.
+
+**Future consideration:** Direct issue creation by the broader community is planned but has no fixed timeline. The label schema and workflow described here are designed to accommodate community contributors without structural changes.
 
 ---
 
@@ -48,6 +52,8 @@ Determine the Jira issue type created during promotion.
 | `bug` | Bug |
 | `feature` | Story |
 
+If both `bug` and `feature` are applied to the same issue, the automation treats it as a `feature`.
+
 ### Lifecycle labels
 Reflect where the issue is in the pipeline. `triaged` and `scheduled` are applied by humans; `in-jira` is applied by automation but may also be applied manually (see below).
 
@@ -56,6 +62,8 @@ Reflect where the issue is in the pipeline. `triaged` and `scheduled` are applie
 | `triaged` | Staff has reviewed and confirmed the issue is valid |
 | `scheduled` | PM has approved this for Jira promotion — trigger label |
 | `in-jira` | A Jira ticket exists for this issue |
+
+**`triaged` is a convention, not enforced by automation.** Because only staff and contractors can currently create issues, the automation does not require `triaged` to be present before promotion. Staff are expected to apply it as part of their review workflow.
 
 **Manual use of `in-jira`:** Staff may apply this label directly when linking a GitHub Issue to a pre-existing Jira ticket, skipping the automated promotion flow. In this case, staff should also post a comment with the Jira ticket URL.
 
@@ -107,7 +115,7 @@ The Jira ticket drives release backlog work. The GitHub Issue remains open and p
 ### 6. Resolution (automated)
 
 When the Jira ticket is marked Done, a Jira webhook triggers the "Close from Jira" GitHub Action, which:
-1. Posts a comment on the GitHub Issue: *"This has been resolved and will be included in an upcoming release."*
+1. Posts a comment on the GitHub Issue referencing the release version (see Action 2 below)
 2. Closes the GitHub Issue
 
 ---
@@ -124,7 +132,7 @@ When the Jira ticket is marked Done, a Jira webhook triggers the "Close from Jir
 **Steps:**
 1. Read issue title, body, type label, and `jira-*` label
 2. Resolve Jira project from `jira-*` label
-3. Resolve Jira issue type: `bug` → Bug, `feature` → Story
+3. Resolve Jira issue type: `feature` → Story, `bug` → Bug; if both type labels are present, use Story
 4. Call Jira REST API to create ticket:
    - Summary ← GitHub Issue title
    - Description ← GitHub Issue body + GitHub Issue URL in footer
@@ -140,8 +148,11 @@ When the Jira ticket is marked Done, a Jira webhook triggers the "Close from Jir
 
 **Steps:**
 1. Parse the GitHub Issue URL from the Jira webhook payload (sourced from the Remote Link stored during creation)
-2. Post comment: *"This has been resolved and will be included in an upcoming release."*
-3. Close the GitHub Issue
+2. Parse the Fix Version from the Jira webhook payload
+3. Post comment:
+   - If Fix Version is present: *"This has been resolved and will be included in release \<version\>."*
+   - If Fix Version is absent: *"This has been resolved and will be included in an upcoming release."*
+4. Close the GitHub Issue
 
 ### Required secrets
 
@@ -160,20 +171,23 @@ When the Jira ticket is marked Done, a Jira webhook triggers the "Close from Jir
 |---|---|
 | Title | Summary |
 | Body | Description |
-| `bug` label | Issue Type: Bug |
-| `feature` label | Issue Type: Story |
+| `bug` label (sole type label) | Issue Type: Bug |
+| `feature` label (or both type labels present) | Issue Type: Story |
 | `jira-ods` label | Project: ODS |
 | `jira-ac` label | Project: AC |
 | Issue URL | Remote Link + Description footer |
 
 Jira fields not sourced from GitHub (assignee, sprint, priority, story points) are set by the team inside Jira during release planning.
 
+## Data Mapping: Jira Ticket → GitHub Issue (on close)
+
+| Jira Ticket field | GitHub Issue |
+|---|---|
+| Remote Link URL | Identifies the GitHub Issue to close |
+| Fix Version (if set) | Referenced in closing comment |
+
 ---
 
 ## Open Questions
 
-- Where will GitHub Issues live? (centralized in `Technology-Roadmap` vs. distributed per product repo)
-- Should the closing comment reference the specific release version once known?
-- Should the `triaged` step be enforced (i.e., block `scheduled` from being applied unless `triaged` is present), or left as a convention?
-- What should happen if both `bug` and `feature` labels are applied? (Guard or default behavior needed)
-- When will issue creation be opened to the broader community?
+- When community issue creation is enabled, should it be gated on a label-based permission check or simply opened to all GitHub users?
