@@ -103,6 +103,34 @@ Determine which Jira project the ticket is created in. Exactly one per issue.
 
 ## Workflow
 
+```mermaid
+flowchart TD
+    A([Staff creates GitHub Issue\nbug or feature template]) --> B[Apply type label\nbug or feature]
+    B --> C[Apply jira-* routing label]
+    C --> D[Staff reviews issue]
+    D --> E{Valid?}
+    E -- No --> F([Issue closed or ignored])
+    E -- Yes --> G[Apply triaged label\nconvention only]
+    G --> H{Jira ticket\nalready exists?}
+
+    H -- Yes\nManual back-linking --> I[Apply in-jira manually\nPost Jira URL comment\nCreate Jira Remote Link]
+    I --> J
+
+    H -- No --> K[PM applies scheduled label]
+    K --> L{Validation\npasses?}
+    L -- Missing or duplicate\nrouting/type label --> M[Error comment posted\nscheduled removed]
+    M --> K
+    L -- Yes --> N[Action 1: Promote to Jira\nCreate Jira ticket\nPost Jira URL comment\nApply in-jira, remove scheduled]
+
+    N --> J([Jira ticket drives\nrelease backlog work\nGitHub Issue remains open])
+
+    J --> O{Jira ticket\nmarked Done?}
+    O -- No --> J
+    O -- Yes --> P[Jira Automation rule fires\nrepository_dispatch to GitHub]
+    P --> Q[Action 2: Close from Jira\nPost resolution comment\nClose GitHub Issue as completed]
+    Q --> R([GitHub Issue closed])
+```
+
 ### 1. Creation
 
 Staff opens a GitHub Issue using the `BUG.yml` or `PROPOSED-FEATURE.yml` template and applies:
