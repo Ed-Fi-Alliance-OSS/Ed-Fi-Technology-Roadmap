@@ -1,0 +1,299 @@
+name: Create Jira Ticket from GitHub Label
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  create-jira-ticket:
+    # Run on every label event — the first step determines if this label is a configured trigger
+    if: vars.GH_JIRA_AUTOMATION_CONFIG != ''
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check if label is a configured project trigger
+        id: trigger_check
+        env:
+          ADDED_LABEL:    ${{ github.event.label.name }}
+          PROJECT_CONFIG: ${{ vars.GH_JIRA_AUTOMATION_CONFIG }}
+        run: |
+          PROJECT_LABEL=$(echo "$PROJECT_CONFIG" | jq -r \
+            --arg trigger "$ADDED_LABEL" '
+            to_entries[] | select(.value.trigger == $trigger) | .key
+          ' | head -1)
+
+          if [ -z "$PROJECT_LABEL" ]; then
+            echo "Label '$ADDED_LABEL' is not a configured project trigger. Skipping."
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "matched=true"          >> "$GITHUB_OUTPUT"
+            echo "project_label=$PROJECT_LABEL" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check actor authorization
+        if: steps.trigger_check.outputs.matched == 'true'
+        uses: actions/github-script@v7
+        env:
+          ORG_READ_TOKEN: ${{ secrets.GH_ORG_READ_PAT }}
+          ALLOWED_TEAMS:  ${{ vars.GH_JIRA_AUTOMATION_ALLOWED_TEAMS }}
+        with:
+          script: |
+            const actor      = context.actor;
+            const teams      = process.env.ALLOWED_TEAMS.split(',').map(t => t.trim());
+            const teamClient = new github.constructor({ auth: process.env.ORG_READ_TOKEN });
+
+            let authorized = false;
+            for (const team of teams) {
+              try {
+                await teamClient.rest.teams.getMembershipForUserInOrg({
+                  org:       context.repo.owner,
+                  team_slug: team,
+                  username:  actor,
+                });
+                authorized = true;
+                console.log(`✅ ${actor} is authorized via team "${team}".`);
+                break;
+              } catch {
+                // not in this team, try the next
+              }
+            }
+
+            if (!authorized) {
+              core.setFailed(`🚫 ${actor} is not a member of any allowed team: ${teams.join(', ')}`);
+            }
+
+      - name: Extract Jira metadata from issue labels
+        if: steps.trigger_check.outputs.matched == 'true'
+        id: jira_meta
+        env:
+          LABELS:          ${{ toJson(github.event.issue.labels) }}
+          PROJECT_CONFIG:  ${{ vars.GH_JIRA_AUTOMATION_CONFIG }}
+          PROJECT_LABEL:   ${{ steps.trigger_check.outputs.project_label }}
+          TYPE_MAP:        ${{ vars.JIRA_GH_TYPE_MAP }}
+        run: |
+          # Project is already determined by the trigger label
+          PROJECT=$(echo "$PROJECT_CONFIG" | jq -r --arg label "$PROJECT_LABEL" '.[$label].key')
+
+          TYPE=$(echo "$LABELS" | jq -r --argjson map "$TYPE_MAP" '
+            .[] | .name as $label | $map[$label] // empty
+          ' | head -1)
+
+          # Assignee is set directly from project config if present
+          ASSIGNEE=$(echo "$PROJECT_CONFIG" | jq -r --arg label "$PROJECT_LABEL" '
+            .[$label].assignee // empty
+          ')
+
+          # Sprint is set directly from project config if present
+          SPRINT=$(echo "$PROJECT_CONFIG" | jq -r --arg label "$PROJECT_LABEL" '
+            .[$label].sprint // empty
+          ')
+
+          # Final Jira label set = (issue labels that appear in "passthroughLabels")
+          # + every entry of "alwaysAddLabels". Sanitized for Jira (spaces -> hyphens)
+          # and de-duplicated. Emitted as compact JSON.
+          PASSTHROUGH_ALLOW=$(echo "$PROJECT_CONFIG" | jq -c --arg label "$PROJECT_LABEL" '.[$label].passthroughLabels // []')
+          ALWAYS_ADD=$(echo "$PROJECT_CONFIG" | jq -c --arg label "$PROJECT_LABEL" '.[$label].alwaysAddLabels // []')
+          TRANSFER_LABELS=$(echo "$LABELS" | jq -c \
+            --argjson allow  "$PASSTHROUGH_ALLOW" \
+            --argjson always "$ALWAYS_ADD" '
+            ( [ .[].name | select(. as $n | $allow | index($n)) ] + $always )
+            | map(gsub(" "; "-"))
+            | unique
+          ')
+
+          echo "project=$PROJECT"          >> "$GITHUB_OUTPUT"
+          echo "issue_type=${TYPE:-Story}" >> "$GITHUB_OUTPUT"
+          echo "assignee=$ASSIGNEE"        >> "$GITHUB_OUTPUT"
+          echo "sprint=$SPRINT"            >> "$GITHUB_OUTPUT"
+          echo "transfer_labels=$TRANSFER_LABELS" >> "$GITHUB_OUTPUT"
+          echo "✅ Resolved → project: $PROJECT, type: ${TYPE:-Story}, assignee: ${ASSIGNEE:-(none)}, sprint: ${SPRINT:-(none)}, labels: ${TRANSFER_LABELS}"
+
+      - name: Check for existing Jira ticket for this project
+        if: steps.trigger_check.outputs.matched == 'true'
+        id: check_existing
+        uses: actions/github-script@v7
+        env:
+          JIRA_PROJECT_KEY: ${{ steps.jira_meta.outputs.project }}
+        with:
+          script: |
+            const owner         = context.repo.owner;
+            const repo          = context.repo.repo;
+            const issueNodeId   = context.payload.issue.node_id;
+            const targetProject = process.env.JIRA_PROJECT_KEY;
+
+            // One query: the repo's "Jira Key" field definition + this issue's current value.
+            const result = await github.graphql(`
+              query($owner: String!, $repo: String!, $issueId: ID!) {
+                repository(owner: $owner, name: $repo) {
+                  issueFields(first: 50) {
+                    nodes {
+                      __typename
+                      ... on IssueFieldText { id name }
+                    }
+                  }
+                }
+                node(id: $issueId) {
+                  ... on Issue {
+                    issueFieldValues(first: 50) {
+                      nodes {
+                        __typename
+                        ... on IssueFieldTextValue {
+                          value
+                          field { ... on IssueFieldText { id name } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { owner, repo, issueId: issueNodeId });
+
+            const fields = result.repository.issueFields.nodes;
+            const jiraField = fields.find(f => f.name === 'Jira Key');
+            if (!jiraField) {
+              core.setFailed(`Could not find "Jira Key" issue field. Available: ${fields.map(f => f.name).join(', ')}`);
+              return;
+            }
+            core.setOutput('field_id', jiraField.id);
+
+            const valueNode = result.node.issueFieldValues.nodes
+              .find(v => v.field && v.field.id === jiraField.id);
+            const existingValue = valueNode ? valueNode.value : '';
+            core.setOutput('existing_value', existingValue);
+
+            // Extract the project prefix from each stored ".../browse/KEY-123" URL.
+            const existingProjects = existingValue
+              .split(',')
+              .map(s => s.trim())
+              .filter(Boolean)
+              .map(url => {
+                const m = url.match(/\/browse\/([A-Za-z][A-Za-z0-9]+)-\d+/);
+                return m ? m[1] : null;
+              })
+              .filter(Boolean);
+
+            const alreadyExists = existingProjects.includes(targetProject);
+            core.setOutput('already_exists', String(alreadyExists));
+
+            if (alreadyExists) {
+              console.log(`Project ${targetProject} already has a ticket for this issue (field: "${existingValue}") — skipping.`);
+            } else {
+              console.log(`No ${targetProject} ticket yet (existing projects: ${existingProjects.join(', ') || 'none'}) — will create.`);
+            }
+
+      - name: Create Jira Ticket
+        if: steps.trigger_check.outputs.matched == 'true' && steps.check_existing.outputs.already_exists == 'false'
+        id: create_ticket
+        env:
+          JIRA_BASE_URL:    ${{ vars.JIRA_BASE_URL }}
+          JIRA_PROJECT_KEY: ${{ steps.jira_meta.outputs.project }}
+          JIRA_ISSUE_TYPE:  ${{ steps.jira_meta.outputs.issue_type }}
+          JIRA_ASSIGNEE_ID: ${{ steps.jira_meta.outputs.assignee }}
+          JIRA_SPRINT_ID:   ${{ steps.jira_meta.outputs.sprint }}
+          JIRA_LABELS:      ${{ steps.jira_meta.outputs.transfer_labels }}
+          JIRA_USER_EMAIL:  ${{ secrets.CREATE_JIRA_TICKET_USER_EMAIL }}
+          JIRA_API_TOKEN:   ${{ secrets.CREATE_JIRA_TICKET_PAT }}
+          ISSUE_TITLE:      ${{ github.event.issue.title }}
+          ISSUE_BODY:       ${{ github.event.issue.body }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg summary     "${ISSUE_TITLE}" \
+            --arg project     "${JIRA_PROJECT_KEY}" \
+            --arg issuetype   "${JIRA_ISSUE_TYPE}" \
+            --arg description "${ISSUE_BODY}" \
+            --arg assignee    "${JIRA_ASSIGNEE_ID}" \
+            --arg sprint      "${JIRA_SPRINT_ID}" \
+            --argjson labels  "${JIRA_LABELS:-[]}" \
+            '{
+              fields: {
+                project:     { key: $project },
+                summary:     $summary,
+                issuetype:   { name: $issuetype },
+                description: {
+                  type: "doc", version: 1,
+                  content: [{ type: "paragraph",
+                    content: [{ type: "text", text: $description }]
+                  }]
+                }
+              }
+            }
+            | if $assignee != "" then .fields.assignee = { accountId: $assignee } else . end
+            | if $sprint   != "" then .fields.customfield_10020 = ($sprint | tonumber) else . end
+            | if ($labels | length) > 0 then .fields.labels = $labels else . end
+            ')
+
+          RESPONSE=$(curl --silent --show-error --fail \
+            --request POST \
+            --url "${JIRA_BASE_URL}/rest/api/3/issue" \
+            --user "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" \
+            --header "Accept: application/json" \
+            --header "Content-Type: application/json" \
+            --data "$PAYLOAD")
+
+          JIRA_KEY=$(echo "$RESPONSE" | jq -r '.key')
+          echo "jira_key=$JIRA_KEY" >> "$GITHUB_OUTPUT"
+          echo "✅ Created Jira ticket: $JIRA_KEY"
+
+      - name: Add GitHub issue link to Jira ticket
+        if: steps.trigger_check.outputs.matched == 'true' && steps.check_existing.outputs.already_exists == 'false'
+        env:
+          JIRA_BASE_URL:   ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ secrets.CREATE_JIRA_TICKET_USER_EMAIL }}
+          JIRA_API_TOKEN:  ${{ secrets.CREATE_JIRA_TICKET_PAT }}
+          JIRA_KEY:        ${{ steps.create_ticket.outputs.jira_key }}
+          ISSUE_URL:       ${{ github.event.issue.html_url }}
+          ISSUE_TITLE:     ${{ github.event.issue.title }}
+          ISSUE_NUMBER:    ${{ github.event.issue.number }}
+        run: |
+          curl --silent --show-error --fail \
+            --request POST \
+            --url "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_KEY}/remotelink" \
+            --user "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" \
+            --header "Accept: application/json" \
+            --header "Content-Type: application/json" \
+            --data "$(jq -n \
+              --arg url   "${ISSUE_URL}" \
+              --arg title "GitHub Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}" \
+              '{
+                object: {
+                  url:   $url,
+                  title: $title,
+                  icon: {
+                    url16x16: "https://github.com/favicon.ico",
+                    title:    "GitHub"
+                  }
+                }
+              }'
+            )"
+          echo "✅ Remote link added to Jira ticket"
+
+      - name: Append Jira URL to issue "Jira Key" field
+        if: steps.trigger_check.outputs.matched == 'true' && steps.check_existing.outputs.already_exists == 'false'
+        uses: actions/github-script@v7
+        env:
+          JIRA_BASE_URL:  ${{ vars.JIRA_BASE_URL }}
+          FIELD_ID:       ${{ steps.check_existing.outputs.field_id }}
+          EXISTING_VALUE: ${{ steps.check_existing.outputs.existing_value }}
+        with:
+          script: |
+            const jiraKey     = '${{ steps.create_ticket.outputs.jira_key }}';
+            const jiraUrl     = `${process.env.JIRA_BASE_URL}/browse/${jiraKey}`;
+            const issueNodeId = context.payload.issue.node_id;
+            const fieldId     = process.env.FIELD_ID;
+            const existing    = process.env.EXISTING_VALUE || '';
+
+            // Append the new ticket URL, comma-separated, preserving any existing entries.
+            const newValue = existing ? `${existing},${jiraUrl}` : jiraUrl;
+
+            await github.graphql(`
+              mutation($issueId: ID!, $fieldId: ID!, $value: String!) {
+                updateIssueFieldValue(input: {
+                  issueId:    $issueId,
+                  issueField: { fieldId: $fieldId, textValue: $value }
+                }) {
+                  issue { id }
+                }
+              }
+            `, { issueId: issueNodeId, fieldId, value: newValue });
+
+            console.log(`✅ "Jira Key" field set to: ${newValue}`);
+
