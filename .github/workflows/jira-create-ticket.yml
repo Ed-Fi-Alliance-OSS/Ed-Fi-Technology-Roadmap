@@ -4,12 +4,16 @@ on:
   issues:
     types: [labeled]
 
+permissions:
+  issues: write
 jobs:
   create-jira-ticket:
     # Run on every label event — the first step determines if this label is a configured trigger
     if: vars.GH_JIRA_AUTOMATION_CONFIG != ''
     runs-on: ubuntu-latest
-
+    concurrency:
+      group: jira-create-ticket-${{ github.event.issue.node_id }}
+      cancel-in-progress: false
     steps:
       - name: Check if label is a configured project trigger
         id: trigger_check
@@ -17,6 +21,11 @@ jobs:
           ADDED_LABEL:    ${{ github.event.label.name }}
           PROJECT_CONFIG: ${{ vars.GH_JIRA_AUTOMATION_CONFIG }}
         run: |
+          if ! echo "$PROJECT_CONFIG" | jq -e . >/dev/null 2>&1; then
+            echo "GH_JIRA_AUTOMATION_CONFIG is not valid JSON. Check the Actions variable value (must be strict JSON, not JSONC)." >&2
+            exit 1
+          fi
+
           PROJECT_LABEL=$(echo "$PROJECT_CONFIG" | jq -r \
             --arg trigger "$ADDED_LABEL" '
             to_entries[] | select(.value.trigger == $trigger) | .key
@@ -37,10 +46,20 @@ jobs:
           ALLOWED_TEAMS:  ${{ vars.GH_JIRA_AUTOMATION_ALLOWED_TEAMS }}
         with:
           script: |
-            const actor      = context.actor;
-            const teams      = process.env.ALLOWED_TEAMS.split(',').map(t => t.trim());
-            const teamClient = new github.constructor({ auth: process.env.ORG_READ_TOKEN });
+            const actor = context.actor;
 
+            const allowedTeamsRaw = (process.env.ALLOWED_TEAMS || '').trim();
+            if (!allowedTeamsRaw) {
+              core.setFailed('GH_JIRA_AUTOMATION_ALLOWED_TEAMS is not set or empty.');
+              return;
+            }
+            const teams = allowedTeamsRaw.split(',').map(t => t.trim()).filter(Boolean);
+
+            if (!process.env.ORG_READ_TOKEN) {
+              core.setFailed('GH_ORG_READ_PAT secret is not set.');
+              return;
+            }
+            const teamClient = new github.constructor({ auth: process.env.ORG_READ_TOKEN });
             let authorized = false;
             for (const team of teams) {
               try {
@@ -71,7 +90,17 @@ jobs:
           TYPE_MAP:        ${{ vars.JIRA_GH_TYPE_MAP }}
         run: |
           # Project is already determined by the trigger label
-          PROJECT=$(echo "$PROJECT_CONFIG" | jq -r --arg label "$PROJECT_LABEL" '.[$label].key')
+          PROJECT=$(echo "$PROJECT_CONFIG" | jq -r --arg label "$PROJECT_LABEL" '.[$label].key // empty')
+          if [ -z "$PROJECT" ]; then
+            echo "No Jira project key configured for project '$PROJECT_LABEL' (expected .[$PROJECT_LABEL].key in GH_JIRA_AUTOMATION_CONFIG)." >&2
+            exit 1
+          fi
+
+          # Validate type map JSON (required for --argjson)
+          if [ -z "$TYPE_MAP" ] || ! echo "$TYPE_MAP" | jq -e . >/dev/null 2>&1; then
+            echo "JIRA_GH_TYPE_MAP must be set to valid JSON (e.g., {\"bug\":\"Bug\"})." >&2
+            exit 1
+          fi
 
           TYPE=$(echo "$LABELS" | jq -r --argjson map "$TYPE_MAP" '
             .[] | .name as $label | $map[$label] // empty
@@ -124,8 +153,7 @@ jobs:
             const result = await github.graphql(`
               query($owner: String!, $repo: String!, $issueId: ID!) {
                 repository(owner: $owner, name: $repo) {
-                  issueFields(first: 50) {
-                    nodes {
+                  issueFields(first: 100) {
                       __typename
                       ... on IssueFieldText { id name }
                     }
@@ -133,8 +161,7 @@ jobs:
                 }
                 node(id: $issueId) {
                   ... on Issue {
-                    issueFieldValues(first: 50) {
-                      nodes {
+                    issueFieldValues(first: 100) {
                         __typename
                         ... on IssueFieldTextValue {
                           value
