@@ -224,11 +224,37 @@ jobs:
           ISSUE_TITLE:      ${{ github.event.issue.title }}
           ISSUE_BODY:       ${{ github.event.issue.body }}
         run: |
+          # Jira Cloud's REST API requires the description in Atlassian Document Format (ADF);
+          # it does NOT render Markdown. GitHub issue bodies are GitHub-flavored Markdown, so
+          # convert them to ADF with marklassian — otherwise headings, lists, code blocks and
+          # links land as a single unformatted plain-text blob (AI-163).
+          npm install marklassian@1.2.1 --no-save --no-audit --no-fund --silent
+
+          # Dynamic import() so this works whether marklassian resolves as CommonJS or ESM.
+          node --input-type=module -e '
+            const { markdownToAdf } = await import("marklassian");
+            const fs = await import("node:fs");
+            const md = process.env.ISSUE_BODY || "";
+            let adf;
+            try {
+              adf = markdownToAdf(md);
+            } catch (err) {
+              // Never fail ticket creation on odd Markdown — fall back to a plain-text paragraph.
+              adf = { version: 1, type: "doc",
+                content: [{ type: "paragraph", content: [{ type: "text", text: md || "(no description provided)" }] }] };
+            }
+            // Jira rejects an empty doc; emit an empty paragraph for bodyless issues.
+            if (!adf.content || adf.content.length === 0) {
+              adf = { version: 1, type: "doc", content: [{ type: "paragraph" }] };
+            }
+            fs.writeFileSync("description.adf.json", JSON.stringify(adf));
+          '
+
           PAYLOAD=$(jq -n \
             --arg summary     "${ISSUE_TITLE}" \
             --arg project     "${JIRA_PROJECT_KEY}" \
             --arg issuetype   "${JIRA_ISSUE_TYPE}" \
-            --arg description "${ISSUE_BODY}" \
+            --slurpfile description description.adf.json \
             --arg assignee    "${JIRA_ASSIGNEE_ID}" \
             --arg sprint      "${JIRA_SPRINT_ID}" \
             --argjson labels  "${JIRA_LABELS:-[]}" \
@@ -237,12 +263,7 @@ jobs:
                 project:     { key: $project },
                 summary:     $summary,
                 issuetype:   { name: $issuetype },
-                description: {
-                  type: "doc", version: 1,
-                  content: [{ type: "paragraph",
-                    content: [{ type: "text", text: $description }]
-                  }]
-                }
+                description: $description[0]
               }
             }
             | if $assignee != "" then .fields.assignee = { accountId: $assignee } else . end
