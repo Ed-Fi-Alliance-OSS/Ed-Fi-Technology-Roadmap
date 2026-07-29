@@ -1,4 +1,4 @@
-name: Create Jira Ticket from GitHub Label
+name: Labelled issue → Jira dev backlog
 
 on:
   issues:
@@ -7,10 +7,15 @@ on:
 permissions:
   issues: write
 jobs:
-  create-jira-ticket:
+  github-to-jira-dev-backlog:
     # Run on every label event — the first step determines if this label is a configured trigger
     if: vars.GH_JIRA_AUTOMATION_CONFIG != ''
     runs-on: ubuntu-latest
+    # Fail fast instead of occupying a runner for the 6-hour default. This job has more hang
+    # surface than its siblings: a runtime `npm install` plus two curls to Jira. Because
+    # cancel-in-progress is false below, a hung run also holds its concurrency group and
+    # stalls later label events on the same issue.
+    timeout-minutes: 10
     concurrency:
       group: jira-create-ticket-${{ github.event.issue.node_id }}
       cancel-in-progress: false
@@ -20,7 +25,30 @@ jobs:
         env:
           ADDED_LABEL:    ${{ github.event.label.name }}
           PROJECT_CONFIG: ${{ vars.GH_JIRA_AUTOMATION_CONFIG }}
+          SENDER_TYPE:    ${{ github.event.sender.type }}
+          SENDER_LOGIN:   ${{ github.event.sender.login }}
         run: |
+          # Ignore label events applied by automation. LOOP GUARD:
+          # jira-agent-create-gh-issue.yml creates GitHub issues for tickets that already came
+          # FROM Jira, applying their labels in the create call, so a trigger label arriving
+          # that way would push the ticket straight back into Jira as a duplicate.
+          #
+          # Today GitHub does not re-trigger workflows for GITHUB_TOKEN-caused events, which is
+          # the only reason this cannot happen. That is documented platform behaviour, not
+          # something this workflow declares, and it stops applying the moment any step in the
+          # chain uses a PAT or a GitHub App token. Check it explicitly instead.
+          #
+          # Deliberately keyed on the SENDER (who added the label), NOT on issue.user (who
+          # opened the issue). A human adding a dev-backlog trigger label to a Jira-origin
+          # issue is legitimate triage and must still work; keying on the author would block
+          # it forever. Type is used rather than a login match so GitHub Apps and other bots
+          # are covered too.
+          if [ "$SENDER_TYPE" = "Bot" ]; then
+            echo "Label was added by '$SENDER_LOGIN' ($SENDER_TYPE), not a person. Skipping."
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if ! echo "$PROJECT_CONFIG" | jq -e . >/dev/null 2>&1; then
             echo "GH_JIRA_AUTOMATION_CONFIG is not valid JSON. Check the Actions variable value (must be strict JSON, not JSONC)." >&2
             exit 1
@@ -40,7 +68,8 @@ jobs:
           fi
       - name: Check actor authorization
         if: steps.trigger_check.outputs.matched == 'true'
-        uses: actions/github-script@v7
+        id: actor_check
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           ORG_READ_TOKEN: ${{ secrets.GH_ORG_READ_PAT }}
           ALLOWED_TEAMS:  ${{ vars.GH_JIRA_AUTOMATION_ALLOWED_TEAMS }}
@@ -59,7 +88,13 @@ jobs:
               core.setFailed('GH_ORG_READ_PAT secret is not set.');
               return;
             }
-            const teamClient = new github.constructor({ auth: process.env.ORG_READ_TOKEN });
+            // Team membership needs a token with read:org, which GITHUB_TOKEN does not have,
+            // so this needs a SECOND client authenticated as GH_ORG_READ_PAT.
+            // getOctokit is injected into the script context by github-script v8+ and is the
+            // supported way to build one. The previous `new github.constructor({ auth })`
+            // reached into @actions/github internals, which v9 explicitly calls out as
+            // unsupported (v9 is ESM-only and added getOctokit as the replacement).
+            const teamClient = getOctokit(process.env.ORG_READ_TOKEN);
             let authorized = false;
             for (const team of teams) {
               try {
@@ -76,12 +111,22 @@ jobs:
               }
             }
 
+            // An unauthorized actor is NOT a failure — the event simply is not actionable, and
+            // the remaining steps skip on this output. Failing here would spend the run's red
+            // status on a routing decision, which is how a genuine breakage (a Jira 400, an npm
+            // outage, a schema change) ends up indistinguishable from routine noise.
+            // Surfaced as a warning so the attempt is still visible in the run summary and
+            // annotations without marking the run failed. Missing configuration above IS a
+            // real failure and still calls setFailed.
+            core.setOutput('authorized', String(authorized));
             if (!authorized) {
-              core.setFailed(`🚫 ${actor} is not a member of any allowed team: ${teams.join(', ')}`);
+              core.warning(
+                `${actor} is not a member of any allowed team (${teams.join(', ')}); ` +
+                `no Jira ticket will be created for this label.`);
             }
 
       - name: Extract Jira metadata from issue labels
-        if: steps.trigger_check.outputs.matched == 'true'
+        if: steps.trigger_check.outputs.matched == 'true' && steps.actor_check.outputs.authorized == 'true'
         id: jira_meta
         env:
           LABELS:          ${{ toJson(github.event.issue.labels) }}
@@ -137,9 +182,9 @@ jobs:
           echo "✅ Resolved → project: $PROJECT, type: ${TYPE:-Story}, assignee: ${ASSIGNEE:-(none)}, sprint: ${SPRINT:-(none)}, labels: ${TRANSFER_LABELS}"
 
       - name: Check for existing Jira ticket for this project
-        if: steps.trigger_check.outputs.matched == 'true'
+        if: steps.trigger_check.outputs.matched == 'true' && steps.actor_check.outputs.authorized == 'true'
         id: check_existing
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           JIRA_PROJECT_KEY: ${{ steps.jira_meta.outputs.project }}
         with:
@@ -210,7 +255,7 @@ jobs:
             }
 
       - name: Create Jira Ticket
-        if: steps.trigger_check.outputs.matched == 'true' && steps.check_existing.outputs.already_exists == 'false'
+        if: steps.trigger_check.outputs.matched == 'true' && steps.actor_check.outputs.authorized == 'true' && steps.check_existing.outputs.already_exists == 'false'
         id: create_ticket
         env:
           JIRA_BASE_URL:    ${{ vars.JIRA_BASE_URL }}
@@ -284,7 +329,7 @@ jobs:
           echo "✅ Created Jira ticket: $JIRA_KEY"
 
       - name: Add GitHub issue link to Jira ticket
-        if: steps.trigger_check.outputs.matched == 'true' && steps.check_existing.outputs.already_exists == 'false'
+        if: steps.trigger_check.outputs.matched == 'true' && steps.actor_check.outputs.authorized == 'true' && steps.check_existing.outputs.already_exists == 'false'
         env:
           JIRA_BASE_URL:   ${{ vars.JIRA_BASE_URL }}
           JIRA_USER_EMAIL: ${{ secrets.CREATE_JIRA_TICKET_USER_EMAIL }}
@@ -317,8 +362,8 @@ jobs:
           echo "✅ Remote link added to Jira ticket"
 
       - name: Append Jira URL to issue "Jira Key" field
-        if: steps.trigger_check.outputs.matched == 'true' && steps.check_existing.outputs.already_exists == 'false'
-        uses: actions/github-script@v7
+        if: steps.trigger_check.outputs.matched == 'true' && steps.actor_check.outputs.authorized == 'true' && steps.check_existing.outputs.already_exists == 'false'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           JIRA_BASE_URL:  ${{ vars.JIRA_BASE_URL }}
           FIELD_ID:       ${{ steps.check_existing.outputs.field_id }}
@@ -346,4 +391,60 @@ jobs:
             `, { issueId: issueNodeId, fieldId, value: newValue });
 
             console.log(`✅ "Jira Key" field set to: ${newValue}`);
+
+      # Runs even when earlier steps skipped or failed, because a skip is now the NORMAL
+      # outcome here (label is not a trigger, bot-applied label, unauthorized actor, or the
+      # project already has a ticket) and a green run with no explanation is the thing that
+      # makes these workflows hard to trust. always() also means a failed run still says how
+      # far it got.
+      - name: Job summary
+        if: always()
+        env:
+          MATCHED:       ${{ steps.trigger_check.outputs.matched }}
+          PROJECT_LABEL: ${{ steps.trigger_check.outputs.project_label }}
+          AUTHORIZED:    ${{ steps.actor_check.outputs.authorized }}
+          PROJECT:       ${{ steps.jira_meta.outputs.project }}
+          ISSUE_TYPE:    ${{ steps.jira_meta.outputs.issue_type }}
+          XFER_LABELS:   ${{ steps.jira_meta.outputs.transfer_labels }}
+          ALREADY:       ${{ steps.check_existing.outputs.already_exists }}
+          EXISTING:      ${{ steps.check_existing.outputs.existing_value }}
+          JIRA_KEY:      ${{ steps.create_ticket.outputs.jira_key }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          ADDED_LABEL:   ${{ github.event.label.name }}
+          SENDER_LOGIN:  ${{ github.event.sender.login }}
+          SENDER_TYPE:   ${{ github.event.sender.type }}
+          ISSUE_NUM:     ${{ github.event.issue.number }}
+          ISSUE_URL:     ${{ github.event.issue.html_url }}
+        run: |
+          {
+            echo "## Labelled issue → Jira dev backlog"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| GitHub issue | [#${ISSUE_NUM}](${ISSUE_URL}) |"
+            echo "| Label added | \`${ADDED_LABEL}\` by \`${SENDER_LOGIN}\` (${SENDER_TYPE}) |"
+            if [ "$MATCHED" != "true" ]; then
+              if [ "$SENDER_TYPE" = "Bot" ]; then
+                echo "| Outcome | **skipped** — label was applied by automation, not a person |"
+              else
+                echo "| Outcome | **skipped** — \`${ADDED_LABEL}\` is not a configured project trigger |"
+              fi
+            elif [ "$AUTHORIZED" != "true" ]; then
+              echo "| Target project | \`${PROJECT_LABEL}\` |"
+              echo "| Outcome | **skipped** — \`${SENDER_LOGIN}\` is not in an allowed team |"
+            elif [ "$ALREADY" = "true" ]; then
+              echo "| Target project | \`${PROJECT}\` |"
+              echo "| Existing linkage | \`${EXISTING}\` |"
+              echo "| Outcome | **skipped** — \`${PROJECT}\` already has a ticket for this issue |"
+            elif [ -n "$JIRA_KEY" ]; then
+              echo "| Jira ticket | [${JIRA_KEY}](${JIRA_BASE_URL}/browse/${JIRA_KEY}) |"
+              echo "| Target project | \`${PROJECT}\` |"
+              echo "| Issue type | ${ISSUE_TYPE:-(none)} |"
+              echo "| Labels transferred | \`${XFER_LABELS:-[]}\` |"
+              echo "| Existing linkage before | \`${EXISTING:-(none)}\` |"
+              echo "| Outcome | **created** |"
+            else
+              echo "| Outcome | **no ticket created** — the trigger matched and the actor was authorized, so a later step failed; see step log |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
