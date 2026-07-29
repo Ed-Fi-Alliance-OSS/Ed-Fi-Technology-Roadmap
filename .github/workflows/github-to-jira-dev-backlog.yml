@@ -332,7 +332,24 @@ jobs:
             --header "Content-Type: application/json" \
             --data "$PAYLOAD")
 
-          JIRA_KEY=$(echo "$RESPONSE" | jq -r '.key')
+          JIRA_KEY=$(echo "$RESPONSE" | jq -r '.key // empty')
+
+          # Jira answered 2xx here - curl --fail would have aborted otherwise - but a success
+          # payload without a .key would leave this empty (or the string "null" without the
+          # `// empty` guard) and the workflow would carry on regardless: POST to
+          # /issue/null/remotelink, then append ".../browse/null" to the "Jira Key" field. That
+          # field is the linkage between the two systems, so a broken entry is worse than a
+          # failure - it looks correct and silently is not, and it is appended, so it persists.
+          # Fail here instead.
+          #
+          # The payload is echoed because --silent --fail discards response bodies, so this is
+          # otherwise the one place a malformed response leaves no diagnostic trace at all.
+          if [ -z "$JIRA_KEY" ]; then
+            echo "Jira returned success but no issue key. Response body:" >&2
+            echo "$RESPONSE" >&2
+            exit 1
+          fi
+
           echo "jira_key=$JIRA_KEY" >> "$GITHUB_OUTPUT"
           echo "✅ Created Jira ticket: $JIRA_KEY"
 
