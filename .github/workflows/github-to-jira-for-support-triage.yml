@@ -120,8 +120,15 @@ jobs:
         env:
           LABELS:       ${{ toJson(github.event.issue.labels) }}
           TYPE_MAP:     ${{ vars.JIRA_GH_TYPE_MAP }}
-          DEFAULT_TYPE: ${{ vars.JIRA_ISSUE_TYPE }}
         run: |
+          # The fallback type is a constant here rather than a configurable variable.
+          # It was the JIRA_ISSUE_TYPE repo variable, but "Story" was already the hard-coded last
+          # resort behind it, so the variable only ever changed which value an unset
+          # map fell back to - one more piece of per-repo configuration to provision
+          # and get wrong. The sibling dev-backlog workflow already hard-codes Story
+          # the same way, so this also makes the two consistent.
+          DEFAULT_TYPE=Story
+
           # Validate type map JSON (required for --argjson)
           if [ -z "$TYPE_MAP" ] || ! echo "$TYPE_MAP" | jq -e . >/dev/null 2>&1; then
             echo "JIRA_GH_TYPE_MAP must be set to valid JSON (e.g., {\"bug\":\"Bug\"})." >&2
@@ -133,8 +140,8 @@ jobs:
             .[] | .name as $label | $map[$label] // empty
           ' | head -1)
 
-          # Fallback order: matched label type -> JIRA_ISSUE_TYPE var -> Story
-          RESOLVED="${TYPE:-${DEFAULT_TYPE:-Story}}"
+          # Fallback order: matched label type -> DEFAULT_TYPE (Story)
+          RESOLVED="${TYPE:-$DEFAULT_TYPE}"
           echo "issue_type=$RESOLVED" >> "$GITHUB_OUTPUT"
           echo "✅ Resolved issue type: $RESOLVED (matched label type: ${TYPE:-none})"
 
