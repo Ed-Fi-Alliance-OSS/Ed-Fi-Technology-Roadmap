@@ -1,7 +1,7 @@
 name: Jira ticket → GitHub issue (product backlog)
 
-# Triggered on-demand by the Jira AI bridge agent (see Jira instructions.md) via a
-# workflow_dispatch call. The agent composes the title/body/labels and states which ticket
+# Triggered on-demand by the Jira AI bridge agent, whose prompt is configured on the Jira
+# side and is not stored in this repo. The agent composes the title/body/labels and states which ticket
 # it is bridging via the jira_key input; this workflow is a thin receiver that:
 #   - skips as a no-op if the Jira ticket already links to an issue in this repo, then
 #   - creates the issue ATOMICALLY with the body + native issue Type + Priority + labels +
@@ -44,6 +44,14 @@ on:
 permissions:
   issues: write
 
+# Hard-coded rather than a repo variable. It is a public URL, not a secret, and the Ed-Fi Jira
+# site is not going to differ between the repos this workflow runs in - so making it
+# configurable only added a per-repo value to provision and get wrong. A site migration would
+# be a visible one-line diff here instead of an invisible settings change.
+# Declared once at workflow level, so every step below inherits it.
+env:
+  JIRA_BASE_URL: https://edfi.atlassian.net
+
 jobs:
   jira-to-github-issue:
     runs-on: ubuntu-latest
@@ -69,8 +77,8 @@ jobs:
           INPUT_JIRA_KEY: ${{ inputs.jira_key }}
           INPUT_LABELS: ${{ inputs.labels }}
           # Jira credentials, used both to check for an existing link and to write the
-          # remote (web) link back onto the ticket.
-          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          # remote (web) link back onto the ticket. JIRA_BASE_URL is inherited from the
+          # workflow-level env above.
           JIRA_USER_EMAIL: ${{ secrets.CREATE_JIRA_TICKET_USER_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.CREATE_JIRA_TICKET_PAT }}
         with:
@@ -156,29 +164,32 @@ jobs:
 
             // 3. Validate the Jira key -----------------------------------------------
             // The key is supplied by the caller rather than parsed out of the body: the
-            // agent knows exactly which ticket it is bridging, so there is nothing to
-            // infer. It is upper-cased because Jira REST lookups by key are
-            // case-sensitive and the sibling triage workflow compares stored project
-            // prefixes case-sensitively.
-            const jiraKey = (process.env.INPUT_JIRA_KEY || '').trim().toUpperCase();
+            // agent knows exactly which ticket it is bridging, so there is nothing to infer.
+            //
+            // The raw input is validated AS GIVEN — deliberately not trimmed or upper-cased
+            // first. The job's concurrency group is keyed on ${{ inputs.jira_key }}, and
+            // Actions expressions have no case function, so the group cannot be normalized to
+            // match. Normalizing here instead would mean "dms-123", "DMS-123" and " DMS-123 "
+            // land in three DIFFERENT concurrency groups while all resolving to the same
+            // ticket — so two such dispatches would run concurrently, both pass the
+            // already-linked check below, and both create an issue. Requiring the canonical
+            // form keeps the group and the logic in agreement. Jira keys are upper-case at
+            // source, so a caller sending anything else has a bug worth failing loudly on.
+            const jiraKey = process.env.INPUT_JIRA_KEY || '';
             if (!/^[A-Z][A-Z0-9]+-\d+$/.test(jiraKey)) {
               core.setFailed(
-                `The "jira_key" input (${JSON.stringify(process.env.INPUT_JIRA_KEY || '')}) ` +
-                `is not a Jira issue key like "DMS-123".`);
+                `The "jira_key" input (${JSON.stringify(jiraKey)}) is not a canonical Jira ` +
+                `issue key like "DMS-123". It must be upper-case with no surrounding ` +
+                `whitespace, because the concurrency group that prevents duplicate issues ` +
+                `is keyed on this value exactly as supplied.`);
               return;
             }
 
             // 4. Jira connection details (shared by the duplicate check in step 5 and the
-            //    remote-link write in step 9). The base URL is linkage-critical now that
-            //    the Support Key value is built from it, so a missing one fails fast
-            //    BEFORE anything is created rather than storing a broken URL.
-            const jiraBase = (process.env.JIRA_BASE_URL || '').replace(/\/+$/, '');
-            if (!jiraBase) {
-              core.setFailed(
-                `The JIRA_BASE_URL repository variable is not set, so "${SUPPORT_FIELD_NAME}" ` +
-                `cannot be built. Refusing to create an issue without its Jira linkage.`);
-              return;
-            }
+            //    remote-link write in step 9). JIRA_BASE_URL is a hard-coded constant in the
+            //    workflow-level env, so it cannot be unset or whitespace and needs no guard
+            //    or normalization here — which is why the previous fail-fast check is gone.
+            const jiraBase = process.env.JIRA_BASE_URL;
             const jiraUrl = `${jiraBase}/browse/${jiraKey}`;
 
             // Contract check: the body must not carry a link to this ticket, or the
