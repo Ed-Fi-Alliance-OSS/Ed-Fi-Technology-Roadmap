@@ -1,0 +1,417 @@
+name: Jira ticket → GitHub issue (product backlog)
+
+# Triggered on-demand by the Jira AI bridge agent (see Jira instructions.md) via a
+# workflow_dispatch call. The agent composes the title/body/labels and states which ticket
+# it is bridging via the jira_key input; this workflow is a thin receiver that:
+#   - skips as a no-op if the Jira ticket already links to an issue in this repo, then
+#   - creates the issue ATOMICALLY with the body + native issue Type + Priority + labels +
+#     the "Jira Support Key" field all set in a single GraphQL createIssue mutation, then
+#   - writes a Jira remote (web) link back (best-effort, de-duplicated by globalId).
+# Setting the Jira Support Key in the same mutation that creates the issue means the
+# issue can never exist without its Jira linkage (no create-then-set window, no orphan).
+# Labels go in that same mutation as label IDs, which also makes it impossible for this
+# workflow to create a label that does not already exist.
+#
+# CONTRACT WITH THE AGENT: the "body" must NOT contain a browse link to jira_key. The
+# Atlassian "GitHub for Jira" app associates any issue whose body carries a Jira key and
+# injects its own backlink, which is why the linkage travels in jira_key instead of being
+# parsed back out of the body. A body that still carries the link is warned about below.
+#
+# The body is otherwise passed through as written, except that @mentions outside code are
+# defused so a Jira description cannot spray GitHub notifications from this repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      title:
+        description: "Issue title (Jira summary)"
+        required: true
+        type: string
+      body:
+        description: "Issue body in Markdown (must NOT include a link to jira_key)"
+        required: true
+        type: string
+      jira_key:
+        description: "Originating Jira issue key, e.g. DMS-123"
+        required: true
+        type: string
+      labels:
+        description: "Comma-separated labels (optional), e.g. dms-platform,bug,priority:medium"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  issues: write
+
+jobs:
+  jira-to-github-issue:
+    runs-on: ubuntu-latest
+    # Fail fast instead of occupying a runner for the 6-hour default. The remote-link step
+    # calls fetch(), and Node's fetch has NO default timeout, so an unresponsive Jira would
+    # otherwise hang here. Because cancel-in-progress is false below, a hung run also holds
+    # its concurrency group, stalling every later dispatch for the same ticket.
+    # Observed runs finish in 11-21s; 10 minutes is generous headroom.
+    timeout-minutes: 10
+    # Serialize dispatches for the same ticket so two near-simultaneous calls cannot both
+    # pass the "already linked?" check below and each create an issue.
+    concurrency:
+      group: jira-agent-create-gh-issue-${{ inputs.jira_key }}
+      cancel-in-progress: false
+    steps:
+      - name: Create issue (atomic) with Jira Support Key, Type, Priority, labels
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          # Pass inputs through env (not string-interpolated into the script) to avoid
+          # script injection from Jira-sourced content.
+          INPUT_TITLE: ${{ inputs.title }}
+          INPUT_BODY: ${{ inputs.body }}
+          INPUT_JIRA_KEY: ${{ inputs.jira_key }}
+          INPUT_LABELS: ${{ inputs.labels }}
+          # Jira credentials, used both to check for an existing link and to write the
+          # remote (web) link back onto the ticket.
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ secrets.CREATE_JIRA_TICKET_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.CREATE_JIRA_TICKET_PAT }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+
+            let title = (process.env.INPUT_TITLE || '').trim();
+            const labelsInput = process.env.INPUT_LABELS || '';
+
+            const SUPPORT_FIELD_NAME = 'Jira Support Key';
+            const PRIORITY_FIELD_NAME = 'Priority';
+            const TITLE_MAX = 256;   // GitHub's hard cap on issue titles
+
+            // 1. Validate title -------------------------------------------------------
+            if (!title) {
+              core.setFailed('The "title" input is empty. A GitHub issue requires a title.');
+              return;
+            }
+            // A Jira summary maxes out at 255 characters, so a straight pass-through fits;
+            // an agent that decorates the title (prefixes, suffixes) can still overshoot.
+            // Truncate rather than fail: a slightly clipped title beats a dispatch that
+            // creates nothing and leaves the ticket unbridged.
+            if (title.length > TITLE_MAX) {
+              core.warning(
+                `Title is ${title.length} characters; GitHub caps issue titles at ` +
+                `${TITLE_MAX}. Truncating.`);
+              title = title.slice(0, TITLE_MAX - 1) + '…';
+            }
+
+            // 1b. Neutralize @mentions in the Jira-sourced body ------------------------
+            // The body reaches GitHub verbatim, so an @user or @org/team written into a
+            // Jira description would deliver real notifications from this repo to people
+            // who never asked for them. A zero-width space after the "@" renders
+            // identically but stops GitHub from linkifying it.
+            // Code spans and fenced blocks are left ALONE: GitHub does not linkify
+            // mentions inside them anyway, and injecting an invisible character would
+            // silently break copy-pasted commands like `npm install @scope/pkg`.
+            const ZWSP = '\u200B';   // invisible, but breaks GitHub's mention parser
+            const escapeMentions = (text) =>
+              text.replace(/(^|[^\w`])@(?=[A-Za-z0-9][A-Za-z0-9-]*)/g, '$1@' + ZWSP);
+            const issueBody = (process.env.INPUT_BODY || '')
+              .split(/(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`)/)
+              .map((segment, i) => (i % 2 === 0 ? escapeMentions(segment) : segment))
+              .join('');
+
+            // 2. Parse labels: "type:*" → native issue Type, "priority:*" → Priority
+            //    field, everything else stays a normal label (resolved to a label ID and
+            //    set in the create mutation).
+            // Unmapped type:/priority: values are dropped entirely (not kept as labels).
+            // TYPE_MAP covers every issue type this repo defines (Task, Bug, Feature).
+            // The agent sends at most one type: and one priority: label, so no conflict
+            // handling is needed here; a second one would simply overwrite the first.
+            const TYPE_MAP = { feature: 'Feature', bug: 'Bug', task: 'Task' };
+            const PRIORITY_MAP = { critical: 'Urgent', high: 'High', medium: 'Medium', low: 'Low' };
+            // Untyped issues are invisible to type-based filtering, so an omitted type:
+            // label falls back rather than leaving the type unset. Mirrors the sibling
+            // triage workflow, which falls back to JIRA_ISSUE_TYPE and then Story.
+            const DEFAULT_TYPE = 'Feature';
+
+            let typeName = null;       // native issue-type name to set (or null)
+            let priorityName = null;   // Priority option name to set (or null)
+            const plainLabels = [];
+
+            for (const raw of labelsInput.split(',').map(s => s.trim()).filter(Boolean)) {
+              const lower = raw.toLowerCase();
+              if (lower.startsWith('type:')) {
+                const mapped = TYPE_MAP[lower.slice(5).trim()];
+                if (mapped) typeName = mapped;
+                else core.info(`Dropping unmapped type label "${raw}"`);
+              } else if (lower.startsWith('priority:')) {
+                const mapped = PRIORITY_MAP[lower.slice(9).trim()];
+                if (mapped) priorityName = mapped;
+                else core.info(`Dropping unmapped priority label "${raw}"`);
+              } else {
+                plainLabels.push(raw);
+              }
+            }
+
+            if (!typeName) {
+              typeName = DEFAULT_TYPE;
+              core.info(`No usable "type:" label supplied; defaulting to "${DEFAULT_TYPE}".`);
+            }
+
+            // 3. Validate the Jira key -----------------------------------------------
+            // The key is supplied by the caller rather than parsed out of the body: the
+            // agent knows exactly which ticket it is bridging, so there is nothing to
+            // infer. It is upper-cased because Jira REST lookups by key are
+            // case-sensitive and the sibling triage workflow compares stored project
+            // prefixes case-sensitively.
+            const jiraKey = (process.env.INPUT_JIRA_KEY || '').trim().toUpperCase();
+            if (!/^[A-Z][A-Z0-9]+-\d+$/.test(jiraKey)) {
+              core.setFailed(
+                `The "jira_key" input (${JSON.stringify(process.env.INPUT_JIRA_KEY || '')}) ` +
+                `is not a Jira issue key like "DMS-123".`);
+              return;
+            }
+
+            // 4. Jira connection details (shared by the duplicate check in step 5 and the
+            //    remote-link write in step 9). The base URL is linkage-critical now that
+            //    the Support Key value is built from it, so a missing one fails fast
+            //    BEFORE anything is created rather than storing a broken URL.
+            const jiraBase = (process.env.JIRA_BASE_URL || '').replace(/\/+$/, '');
+            if (!jiraBase) {
+              core.setFailed(
+                `The JIRA_BASE_URL repository variable is not set, so "${SUPPORT_FIELD_NAME}" ` +
+                `cannot be built. Refusing to create an issue without its Jira linkage.`);
+              return;
+            }
+            const jiraUrl = `${jiraBase}/browse/${jiraKey}`;
+
+            // Contract check: the body must not carry a link to this ticket, or the
+            // Atlassian "GitHub for Jira" app will associate the issue and inject its own
+            // backlink. Warn rather than fail — the issue and its linkage are still
+            // correct, but the agent needs fixing. Links to OTHER tickets are legitimate
+            // cross-references and are left alone.
+            if (new RegExp(`/browse/${jiraKey}(?!\\d)`, 'i').test(issueBody)) {
+              core.warning(
+                `The body contains a browse link to ${jiraKey}. The agent should pass the ` +
+                `linkage in jira_key only; the Atlassian app may now inject a backlink.`);
+            }
+
+            const jiraEmail = process.env.JIRA_USER_EMAIL;
+            const jiraToken = process.env.JIRA_API_TOKEN;
+            const jiraAuth = (jiraEmail && jiraToken)
+              ? 'Basic ' + Buffer.from(`${jiraEmail}:${jiraToken}`).toString('base64')
+              : null;
+            const issueUrlPrefix = `https://github.com/${owner}/${repo}/issues/`;
+
+            // 5. Skip if this ticket is already bridged ------------------------------
+            // The remote link written in step 9 is the durable "already bridged" marker,
+            // so a repeat dispatch (agent retry, double dispatch) is an idempotent no-op
+            // rather than a second GitHub issue for the same ticket.
+            // Residual gap: a previous run that created the issue but failed to write the
+            // remote link leaves no marker here, so a re-dispatch would still duplicate.
+            if (jiraAuth) {
+              try {
+                const res = await fetch(`${jiraBase}/rest/api/3/issue/${jiraKey}/remotelink`, {
+                  headers: { Authorization: jiraAuth, Accept: 'application/json' },
+                });
+                if (!res.ok) {
+                  core.warning(
+                    `Could not read Jira remote links for ${jiraKey} (HTTP ${res.status}); ` +
+                    `proceeding without the duplicate check.`);
+                } else {
+                  const links = await res.json();
+                  const alreadyLinked = (Array.isArray(links) ? links : [])
+                    .map(l => l && l.object && l.object.url)
+                    .find(u => typeof u === 'string' && u.startsWith(issueUrlPrefix));
+                  if (alreadyLinked) {
+                    core.info(`${jiraKey} already links to ${alreadyLinked}; nothing to do.`);
+                    await core.summary
+                      .addHeading('Jira → GitHub issue skipped (already linked)', 2)
+                      .addList([
+                        `Jira ticket: ${jiraKey}`,
+                        `Existing issue: ${alreadyLinked}`,
+                      ])
+                      .write();
+                    return;
+                  }
+                }
+              } catch (err) {
+                core.warning(
+                  `Could not read Jira remote links for ${jiraKey} (${err.message}); ` +
+                  `proceeding without the duplicate check.`);
+              }
+            } else {
+              core.warning('Jira credentials not available; skipping the duplicate check.');
+            }
+
+            // 6. Resolve everything the atomic create needs (repo id, issue types,
+            //    issue fields) in one query.
+            const meta = await github.graphql(`
+              query($owner:String!, $repo:String!) {
+                repository(owner:$owner, name:$repo) {
+                  id
+                  issueTypes(first:20) { nodes { id name } }
+                  issueFields(first:100) {
+                    nodes {
+                      __typename
+                      ... on IssueFieldText { id name }
+                      ... on IssueFieldSingleSelect { id name options { id name } }
+                    }
+                  }
+                }
+              }`, { owner, repo });
+            const repositoryId = meta.repository.id;
+            const typeNodes = meta.repository.issueTypes.nodes || [];
+            const fieldNodes = meta.repository.issueFields.nodes || [];
+
+            // Support Key is linkage-critical: if the field is missing there is nowhere to
+            // record the ticket, so fail fast BEFORE creating anything (no orphan possible).
+            const supportField = fieldNodes.find(n => n.name === SUPPORT_FIELD_NAME);
+            if (!supportField) {
+              core.setFailed(
+                `"${SUPPORT_FIELD_NAME}" issue field not found. Available: ` +
+                fieldNodes.map(n => n.name).filter(Boolean).join(', '));
+              return;
+            }
+            const supportFieldId = supportField.id;
+
+            // Type + Priority are best-effort: resolve if present, warn (do not fail) if not.
+            let issueTypeId = null;
+            if (typeName) {
+              const t = typeNodes.find(n => n.name === typeName);
+              if (t) issueTypeId = t.id;
+              else core.warning(`Issue type "${typeName}" not found; leaving type unset.`);
+            }
+            let priorityFieldId = null, priorityOptionId = null;
+            if (priorityName) {
+              const pf = fieldNodes.find(n => n.name === PRIORITY_FIELD_NAME && Array.isArray(n.options));
+              const opt = pf && pf.options.find(o => o.name === priorityName);
+              if (!pf) core.warning(`"${PRIORITY_FIELD_NAME}" field not found; leaving priority unset.`);
+              else if (!opt) core.warning(`Priority option "${priorityName}" not found; leaving priority unset.`);
+              else { priorityFieldId = pf.id; priorityOptionId = opt.id; }
+            }
+
+            // 7. Resolve plain labels to label NODE IDs, before the create -----------
+            // Only labels that ALREADY exist in the repo resolve to an ID, and passing
+            // IDs (rather than names) means the create mutation *cannot* invent a label —
+            // so a typo or one-off value from the agent can never pollute the repo's label
+            // set. This is why labels are not sent by name: the REST addLabels endpoint
+            // creates missing labels instead of rejecting them. Unknown labels are
+            // skipped. Matching is case-insensitive, so casing drift ("Bug" vs "bug")
+            // still resolves, and the repo's own spelling is what gets applied.
+            // Labels are best-effort: if the label list cannot be read, the issue is
+            // still created (unlabelled) rather than lost.
+            const labelIds = [];
+            let labelSummary = '(none)';
+            if (plainLabels.length) {
+              let existing = null;
+              try {
+                const all = await github.paginate(github.rest.issues.listLabelsForRepo, {
+                  owner, repo, per_page: 100,
+                });
+                existing = new Map(all.map(l => [l.name.toLowerCase(), l]));
+              } catch (err) {
+                // Without the repo's label list the input cannot be safely filtered.
+                core.warning(
+                  `Could not list repository labels (${err.message}); creating the issue ` +
+                  `without labels rather than risk creating one.`);
+              }
+
+              if (!existing) {
+                labelSummary = '(none — label list unavailable)';
+              } else {
+                const resolved = [];
+                const skipped = [];
+                const seen = new Set();
+                for (const name of plainLabels) {
+                  const label = existing.get(name.toLowerCase());
+                  if (!label) { skipped.push(name); continue; }
+                  if (seen.has(label.node_id)) continue;   // dedupe "bug,Bug" → one entry
+                  seen.add(label.node_id);
+                  resolved.push(label.name);
+                  labelIds.push(label.node_id);
+                }
+                if (skipped.length) {
+                  core.info(
+                    `Skipping labels not present in ${owner}/${repo}: ${skipped.join(', ')}`);
+                }
+                labelSummary = resolved.length ? resolved.join(', ') : '(none)';
+                if (skipped.length) {
+                  labelSummary += ` (${skipped.length} skipped: ${skipped.join(', ')})`;
+                }
+              }
+            }
+
+            // 8. Create the issue ATOMICALLY: body + Support Key + Type + Priority
+            //    + labels all in one mutation. The issue cannot exist without its Jira
+            //    Support Key, so there is no create-then-set window and no orphan.
+            const issueFields = [{ fieldId: supportFieldId, textValue: jiraUrl }];
+            if (priorityFieldId && priorityOptionId) {
+              issueFields.push({ fieldId: priorityFieldId, singleSelectOptionId: priorityOptionId });
+            }
+            const input = { repositoryId, title, body: issueBody, issueFields };
+            if (issueTypeId) input.issueTypeId = issueTypeId;
+            if (labelIds.length) input.labelIds = labelIds;
+
+            const createRes = await github.graphql(`
+              mutation($input: CreateIssueInput!) {
+                createIssue(input: $input) { issue { number id url } }
+              }`, { input });
+            const issue = createRes.createIssue.issue;
+            core.info(`Created issue #${issue.number}: ${issue.url}`);
+            core.info(`Set "${SUPPORT_FIELD_NAME}" = ${jiraUrl} (atomic)`);
+            if (issueTypeId) core.info(`Set issue type = ${typeName} (atomic)`);
+            if (priorityOptionId) core.info(`Set Priority = ${priorityName} (atomic)`);
+            if (labelIds.length) core.info(`Applied labels: ${labelSummary} (atomic)`);
+
+            // 9. Write a Jira remote (web) link back to the GitHub issue (best-effort).
+            // Provides the Jira → GitHub direction (the field is GitHub → Jira), is how the
+            // created issue's URL reaches Jira, and is the marker step 5 reads to detect an
+            // already-bridged ticket. globalId makes the POST an upsert, so a re-run
+            // updates the existing link instead of stacking duplicates on the ticket.
+            // A failure only warns: the Support Key field is already set atomically, so a
+            // missing remote link never orphans the issue.
+            let remoteLinkStatus;
+            if (!jiraAuth) {
+              remoteLinkStatus = '(skipped — Jira credentials not available)';
+              core.warning('Jira credentials not available; skipping Jira remote link.');
+            } else {
+              try {
+                const res = await fetch(`${jiraBase}/rest/api/3/issue/${jiraKey}/remotelink`, {
+                  method: 'POST',
+                  headers: {
+                    Authorization: jiraAuth,
+                    Accept: 'application/json',
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify({
+                    globalId: `github-issue-${issue.id}`,
+                    object: {
+                      url: issue.url,
+                      title: `GitHub Issue #${issue.number}: ${title}`,
+                      icon: { url16x16: 'https://github.com/favicon.ico', title: 'GitHub' },
+                    },
+                  }),
+                });
+                if (!res.ok) {
+                  remoteLinkStatus = `FAILED (HTTP ${res.status})`;
+                  core.warning(`Failed to add Jira remote link to ${jiraKey}: HTTP ${res.status} ${await res.text()}`);
+                } else {
+                  remoteLinkStatus = `added on ${jiraKey}`;
+                  core.info(`Added Jira remote link on ${jiraKey} → ${issue.url}`);
+                }
+              } catch (err) {
+                remoteLinkStatus = `FAILED (${err.message})`;
+                core.warning(`Could not add Jira remote link to ${jiraKey}: ${err.message}`);
+              }
+            }
+
+            // 10. Job summary --------------------------------------------------------
+            await core.summary
+              .addHeading('Jira → GitHub issue created', 2)
+              .addList([
+                `Issue: #${issue.number}`,
+                `URL: ${issue.url}`,
+                `Type: ${issueTypeId ? typeName : '(none)'}`,
+                `Priority: ${priorityOptionId ? priorityName : '(none)'}`,
+                `Labels: ${labelSummary}`,
+                `${SUPPORT_FIELD_NAME}: ${jiraUrl}`,
+                `Jira remote link: ${remoteLinkStatus}`,
+              ])
+              .write();
