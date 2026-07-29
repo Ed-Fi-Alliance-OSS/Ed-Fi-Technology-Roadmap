@@ -73,6 +73,15 @@ jobs:
             //
             // The positive signals ARE trustworthy, so honour them without an API call and
             // only pay for the org lookup when the association is inconclusive.
+            //
+            // COLLABORATOR is deliberately in this list even though a collaborator need not be
+            // an org member. The test being applied is "can this person act on the repo
+            // directly?", not "are they in the org": support triage exists to route people who
+            // CANNOT just open a pull request. Anyone granted write access has been vetted by
+            // definition, so raising a support ticket on their behalf would be noise.
+            // Consequence to be aware of: an OUTSIDE collaborator short-circuits here and is
+            // never checked against org membership. Drop COLLABORATOR from this list if org
+            // membership should be the sole criterion instead.
             if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) {
               core.info(`Author association "${association}" is internal. Skipping.`);
               core.setOutput('is_external', 'false');
@@ -281,7 +290,23 @@ jobs:
             --header "Content-Type: application/json" \
             --data "$PAYLOAD")
 
-          JIRA_KEY=$(echo "$RESPONSE" | jq -r '.key')
+          JIRA_KEY=$(echo "$RESPONSE" | jq -r '.key // empty')
+
+          # Jira answered 2xx here - curl --fail would have aborted otherwise - but a success
+          # payload without a .key would leave this empty (or the string "null" without the
+          # `// empty` guard) and the workflow would carry on regardless: POST to
+          # /issue/null/remotelink, then write ".../browse/null" into "Jira Support Key". That
+          # value is the linkage between the two systems, so a broken one is worse than a
+          # failure - it looks correct and silently is not. Fail here instead.
+          #
+          # The payload is echoed because --silent --fail discards response bodies, so this is
+          # otherwise the one place a malformed response leaves no diagnostic trace at all.
+          if [ -z "$JIRA_KEY" ]; then
+            echo "Jira returned success but no issue key. Response body:" >&2
+            echo "$RESPONSE" >&2
+            exit 1
+          fi
+
           echo "jira_key=$JIRA_KEY" >> "$GITHUB_OUTPUT"
           echo "✅ Created Jira ticket: $JIRA_KEY"
 
