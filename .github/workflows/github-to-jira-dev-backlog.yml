@@ -115,8 +115,30 @@ jobs:
                 authorized = true;
                 console.log(`✅ ${actor} is authorized via team "${team}".`);
                 break;
-              } catch {
-                // not in this team, try the next
+              } catch (err) {
+                // 404 is the expected "this user is not in this team" answer, so move on.
+                //
+                // Anything else must FAIL rather than be read as "not in team": 401 or 403 for
+                // an expired GH_ORG_READ_PAT or one missing read:org, plus 5xx and rate limits.
+                // Swallowing those used to be merely confusing, because an unauthorized actor
+                // failed the run anyway. Now that an unauthorized actor is a green-run skip, a
+                // broken credential would instead report a PERSON as not being in a team —
+                // a false statement about someone — while the automation quietly stopped
+                // working and every run still looked fine.
+                //
+                // This mirrors the org-membership check in github-to-jira-for-support-triage.yml,
+                // which treats only 404 as a definitive negative and refuses to guess otherwise.
+                //
+                // Known limitation: a mistyped team slug in GH_JIRA_AUTOMATION_ALLOWED_TEAMS
+                // also returns 404 and is indistinguishable from a genuine non-member, so a
+                // typo reads as "not authorized" rather than as misconfiguration.
+                if (err.status !== 404) {
+                  core.setFailed(
+                    `Could not determine whether ${actor} is in team "${team}" ` +
+                    `(HTTP ${err.status}: ${err.message}). Refusing to treat this as ` +
+                    `"not a member" — check GH_ORG_READ_PAT is valid and has read:org.`);
+                  return;
+                }
               }
             }
 
@@ -423,6 +445,18 @@ jobs:
       - name: Job summary
         if: always()
         env:
+          # Step OUTCOMES, not just outputs. A step that fails before writing its output leaves
+          # that output empty, which the skip branches below would otherwise read as a negative
+          # answer — reporting invalid config as "not a configured trigger", or a missing
+          # GH_ORG_READ_PAT as "<person> is not in an allowed team". Naming a person for what is
+          # a configuration fault is the worst version of that. Outcomes are checked FIRST so a
+          # failure is never dressed up as a routing decision, and this covers any future
+          # failure path automatically rather than only the ones instrumented today.
+          TRIGGER_OUTCOME:  ${{ steps.trigger_check.outcome }}
+          ACTOR_OUTCOME:    ${{ steps.actor_check.outcome }}
+          META_OUTCOME:     ${{ steps.jira_meta.outcome }}
+          EXISTING_OUTCOME: ${{ steps.check_existing.outcome }}
+          CREATE_OUTCOME:   ${{ steps.create_ticket.outcome }}
           MATCHED:       ${{ steps.trigger_check.outputs.matched }}
           PROJECT_LABEL: ${{ steps.trigger_check.outputs.project_label }}
           AUTHORIZED:    ${{ steps.actor_check.outputs.authorized }}
@@ -445,7 +479,17 @@ jobs:
             echo "|---|---|"
             echo "| GitHub issue | [#${ISSUE_NUM}](${ISSUE_URL}) |"
             echo "| Label added | \`${ADDED_LABEL}\` by \`${SENDER_LOGIN}\` (${SENDER_TYPE}) |"
-            if [ "$MATCHED" != "true" ]; then
+            if [ "$TRIGGER_OUTCOME" = "failure" ]; then
+              echo "| Outcome | **failed** — the trigger check errored before deciding; \`GH_JIRA_AUTOMATION_CONFIG\` is most likely not valid JSON. See the step log. |"
+            elif [ "$ACTOR_OUTCOME" = "failure" ]; then
+              echo "| Outcome | **failed** — authorization could not be determined. Either \`GH_JIRA_AUTOMATION_ALLOWED_TEAMS\` or \`GH_ORG_READ_PAT\` is missing, or the team lookup itself failed. This is **not** a statement that \`${SENDER_LOGIN}\` lacks access. See the step log. |"
+            elif [ "$META_OUTCOME" = "failure" ]; then
+              echo "| Outcome | **failed** — could not resolve the Jira project or issue type; check \`GH_JIRA_AUTOMATION_CONFIG\` and \`JIRA_GH_TYPE_MAP\`. See the step log. |"
+            elif [ "$EXISTING_OUTCOME" = "failure" ]; then
+              echo "| Outcome | **failed** — could not read the \`Jira Key\` issue field to check for an existing ticket. See the step log. |"
+            elif [ "$CREATE_OUTCOME" = "failure" ]; then
+              echo "| Outcome | **failed** — Jira ticket creation failed. See the step log for the response body. |"
+            elif [ "$MATCHED" != "true" ]; then
               if [ "$SENDER_TYPE" = "Bot" ]; then
                 echo "| Outcome | **skipped** — label was applied by automation, not a person |"
               else
