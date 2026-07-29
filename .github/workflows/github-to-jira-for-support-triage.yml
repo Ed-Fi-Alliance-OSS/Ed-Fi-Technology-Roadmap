@@ -7,6 +7,14 @@ on:
 permissions:
   issues: write
 
+# Hard-coded rather than a repo variable. It is a public URL, not a secret, and the Ed-Fi Jira
+# site is not going to differ between the repos this workflow runs in - so making it
+# configurable only added a per-repo value to provision and get wrong. A site migration would
+# be a visible one-line diff here instead of an invisible settings change.
+# Declared once at workflow level, so every step below inherits it.
+env:
+  JIRA_BASE_URL: https://edfi.atlassian.net
+
 jobs:
   github-to-jira-support-triage:
     runs-on: ubuntu-latest
@@ -239,7 +247,6 @@ jobs:
         if: steps.external_check.outputs.is_external == 'true' && steps.check_existing.outputs.already_exists == 'false'
         id: create_ticket
         env:
-          JIRA_BASE_URL:    ${{ vars.JIRA_BASE_URL }}
           JIRA_SUPPORT_PROJECT_KEY: ${{ vars.JIRA_SUPPORT_PROJECT_KEY }}
           JIRA_ISSUE_TYPE:  ${{ steps.jira_meta.outputs.issue_type }}
           JIRA_USER_EMAIL:  ${{ secrets.CREATE_JIRA_TICKET_USER_EMAIL }}
@@ -281,7 +288,6 @@ jobs:
       - name: Add GitHub issue link to Jira ticket
         if: steps.external_check.outputs.is_external == 'true' && steps.check_existing.outputs.already_exists == 'false'
         env:
-          JIRA_BASE_URL:   ${{ vars.JIRA_BASE_URL }}
           JIRA_USER_EMAIL: ${{ secrets.CREATE_JIRA_TICKET_USER_EMAIL }}
           JIRA_API_TOKEN:  ${{ secrets.CREATE_JIRA_TICKET_PAT }}
           JIRA_KEY:        ${{ steps.create_ticket.outputs.jira_key }}
@@ -315,7 +321,6 @@ jobs:
         if: steps.external_check.outputs.is_external == 'true' && steps.check_existing.outputs.already_exists == 'false'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          JIRA_BASE_URL:  ${{ vars.JIRA_BASE_URL }}
           FIELD_ID:       ${{ steps.check_existing.outputs.field_id }}
           EXISTING_VALUE: ${{ steps.check_existing.outputs.existing_value }}
         with:
@@ -354,7 +359,6 @@ jobs:
           EXISTING:      ${{ steps.check_existing.outputs.existing_value }}
           ISSUE_TYPE:    ${{ steps.jira_meta.outputs.issue_type }}
           JIRA_KEY:      ${{ steps.create_ticket.outputs.jira_key }}
-          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
           AUTHOR_LOGIN:  ${{ github.event.issue.user.login }}
           ASSOCIATION:   ${{ github.event.issue.author_association }}
           ISSUE_NUM:     ${{ github.event.issue.number }}
