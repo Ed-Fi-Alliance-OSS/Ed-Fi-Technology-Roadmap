@@ -1,0 +1,413 @@
+name: External issue → Jira support triage
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+# Hard-coded rather than a repo variable. It is a public URL, not a secret, and the Ed-Fi Jira
+# site is not going to differ between the repos this workflow runs in - so making it
+# configurable only added a per-repo value to provision and get wrong. A site migration would
+# be a visible one-line diff here instead of an invisible settings change.
+# Declared once at workflow level, so every step below inherits it.
+env:
+  JIRA_BASE_URL: https://edfi.atlassian.net
+
+jobs:
+  github-to-jira-support-triage:
+    runs-on: ubuntu-latest
+    # Fail fast instead of occupying a runner for the 6-hour default: this job curls Jira,
+    # and a hung request would otherwise sit here. Because cancel-in-progress is false
+    # below, a hung run also holds its concurrency group for that issue.
+    # Observed runs finish in 8-10s (one 220s outlier, mostly queue time); 10 minutes is
+    # generous headroom.
+    timeout-minutes: 10
+    concurrency:
+      group: jira-create-from-external-issue-${{ github.event.issue.node_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Check if issue author is external to the organization
+        id: external_check
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          AUTHOR_ASSOCIATION: ${{ github.event.issue.author_association }}
+          AUTHOR_TYPE:        ${{ github.event.issue.user.type }}
+          AUTHOR_LOGIN:       ${{ github.event.issue.user.login }}
+          ORG_READ_TOKEN:     ${{ secrets.GH_ORG_READ_PAT }}
+        with:
+          script: |
+            const login       = process.env.AUTHOR_LOGIN || '';
+            const association = process.env.AUTHOR_ASSOCIATION || '';
+            const org         = context.repo.owner;
+
+            // Bots are never external submitters. This is a LOOP GUARD, not a nicety:
+            // jira-agent-create-gh-issue.yml creates GitHub issues for tickets that already
+            // came FROM Jira, and sending those back would duplicate the ticket.
+            //
+            // Do NOT rely on GitHub declining to re-trigger workflows for GITHUB_TOKEN-caused
+            // events. That is documented platform behaviour, it is the only thing preventing
+            // the loop today, and it stops applying the moment any step in that chain uses a
+            // PAT or GitHub App token.
+            //
+            // It also cannot be inferred from author_association: github-actions[bot] reports
+            // NONE, which would otherwise be classified as EXTERNAL and let through.
+            if (process.env.AUTHOR_TYPE === 'Bot') {
+              core.info(`Author "${login}" is a bot. Not an external submitter. Skipping.`);
+              core.setOutput('is_external', 'false');
+              return;
+            }
+
+            // author_association is a REPO-relationship field and is NOT a reliable proxy for
+            // org membership. It only reports MEMBER when the member's org membership is
+            // PUBLIC; for a member whose membership is private, GitHub falls back to their
+            // next-strongest relationship with the repo. An org member who has ever committed
+            // here therefore reports CONTRIBUTOR, and one who has not reports NONE — both
+            // indistinguishable from a genuine outsider. That is exactly how issue #57 reached
+            // Jira as EDFI-2871 (run 30474672197): a private org member reported CONTRIBUTOR.
+            //
+            // Widening the internal list to include CONTRIBUTOR would be worse than the bug:
+            // a real external contributor whose PR was merged once also reports CONTRIBUTOR,
+            // so genuine support requests would be dropped silently.
+            //
+            // The positive signals ARE trustworthy, so honour them without an API call and
+            // only pay for the org lookup when the association is inconclusive.
+            //
+            // COLLABORATOR is deliberately in this list even though a collaborator need not be
+            // an org member. The test being applied is "can this person act on the repo
+            // directly?", not "are they in the org": support triage exists to route people who
+            // CANNOT just open a pull request. Anyone granted write access has been vetted by
+            // definition, so raising a support ticket on their behalf would be noise.
+            // Consequence to be aware of: an OUTSIDE collaborator short-circuits here and is
+            // never checked against org membership. Drop COLLABORATOR from this list if org
+            // membership should be the sole criterion instead.
+            if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) {
+              core.info(`Author association "${association}" is internal. Skipping.`);
+              core.setOutput('is_external', 'false');
+              return;
+            }
+
+            // Inconclusive association — ask the org directly. This needs read:org, which
+            // GITHUB_TOKEN does not carry, hence GH_ORG_READ_PAT (the same secret the
+            // dev-backlog workflow uses for its team lookup).
+            if (!process.env.ORG_READ_TOKEN) {
+              core.setFailed(
+                `Author association is "${association}", which cannot distinguish a private ` +
+                `org member from an outsider, and GH_ORG_READ_PAT is not set so membership ` +
+                `cannot be checked. Refusing to guess.`);
+              return;
+            }
+
+            const orgClient = getOctokit(process.env.ORG_READ_TOKEN);
+            let isMember;
+            try {
+              await orgClient.rest.orgs.checkMembershipForUser({ org, username: login });
+              isMember = true;              // 204 = member
+            } catch (err) {
+              if (err.status === 404) {
+                isMember = false;           // 404 = definitively not a member
+              } else {
+                // 302 means the PAT's owner is not an org member, so the answer is unknowable.
+                // Anything else is an outage or a bad token. Either way this is a REAL failure:
+                // guessing would silently create a Jira ticket for an insider or silently drop
+                // an external report.
+                core.setFailed(
+                  `Could not determine whether "${login}" belongs to ${org} ` +
+                  `(HTTP ${err.status}: ${err.message}). Refusing to guess.`);
+                return;
+              }
+            }
+
+            if (isMember) {
+              core.info(
+                `Author "${login}" reports association "${association}" but IS a member of ` +
+                `${org} (private membership). Treating as internal. Skipping.`);
+              core.setOutput('is_external', 'false');
+            } else {
+              core.info(
+                `Author "${login}" is not a member of ${org} (association "${association}"). ` +
+                `Treating as external. Proceeding.`);
+              core.setOutput('is_external', 'true');
+            }
+
+      - name: Resolve Jira issue type from issue labels
+        if: steps.external_check.outputs.is_external == 'true'
+        id: jira_meta
+        env:
+          LABELS:       ${{ toJson(github.event.issue.labels) }}
+          TYPE_MAP:     ${{ vars.JIRA_GH_TYPE_MAP }}
+        run: |
+          # The fallback type is a constant here rather than a configurable variable.
+          # It was the JIRA_ISSUE_TYPE repo variable, but "Story" was already the hard-coded last
+          # resort behind it, so the variable only ever changed which value an unset
+          # map fell back to - one more piece of per-repo configuration to provision
+          # and get wrong. The sibling dev-backlog workflow already hard-codes Story
+          # the same way, so this also makes the two consistent.
+          DEFAULT_TYPE=Story
+
+          # Validate type map JSON (required for --argjson)
+          if [ -z "$TYPE_MAP" ] || ! echo "$TYPE_MAP" | jq -e . >/dev/null 2>&1; then
+            echo "JIRA_GH_TYPE_MAP must be set to valid JSON (e.g., {\"bug\":\"Bug\"})." >&2
+            exit 1
+          fi
+
+          # Walk the issue's labels; first one that appears in the map wins.
+          TYPE=$(echo "$LABELS" | jq -r --argjson map "$TYPE_MAP" '
+            .[] | .name as $label | $map[$label] // empty
+          ' | head -1)
+
+          # Fallback order: matched label type -> DEFAULT_TYPE (Story)
+          RESOLVED="${TYPE:-$DEFAULT_TYPE}"
+          echo "issue_type=$RESOLVED" >> "$GITHUB_OUTPUT"
+          echo "✅ Resolved issue type: $RESOLVED (matched label type: ${TYPE:-none})"
+
+      - name: Check whether this issue is already bridged to Jira
+        if: steps.external_check.outputs.is_external == 'true'
+        id: check_existing
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          JIRA_SUPPORT_PROJECT_KEY: ${{ vars.JIRA_SUPPORT_PROJECT_KEY }}
+        with:
+          script: |
+            const owner         = context.repo.owner;
+            const repo          = context.repo.repo;
+            const issueNodeId   = context.payload.issue.node_id;
+            const targetProject = process.env.JIRA_SUPPORT_PROJECT_KEY;
+
+            if (!targetProject) {
+              core.setFailed('JIRA_SUPPORT_PROJECT_KEY variable is not set.');
+              return;
+            }
+
+            // One query: the repo's "Jira Support Key" field definition + this issue's current value.
+            const result = await github.graphql(`
+              query($owner: String!, $repo: String!, $issueId: ID!) {
+                repository(owner: $owner, name: $repo) {
+                  issueFields(first: 100) {
+                    nodes {
+                      __typename
+                      ... on IssueFieldText { id name }
+                    }
+                  }
+                }
+                node(id: $issueId) {
+                  ... on Issue {
+                    issueFieldValues(first: 100) {
+                      nodes {
+                        __typename
+                        ... on IssueFieldTextValue {
+                          value
+                          field { ... on IssueFieldText { id name } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { owner, repo, issueId: issueNodeId });
+
+            const fields = result.repository.issueFields.nodes;
+            const jiraField = fields.find(f => f.name === 'Jira Support Key');
+            if (!jiraField) {
+              core.setFailed(`Could not find "Jira Support Key" issue field. Available: ${fields.map(f => f.name).join(', ')}`);
+              return;
+            }
+            core.setOutput('field_id', jiraField.id);
+
+            const valueNode = result.node.issueFieldValues.nodes
+              .find(v => v.field && v.field.id === jiraField.id);
+            const existingValue = valueNode ? valueNode.value : '';
+            core.setOutput('existing_value', existingValue);
+
+            // Extract the project prefix from each stored ".../browse/KEY-123" URL.
+            const existingProjects = existingValue
+              .split(',')
+              .map(s => s.trim())
+              .filter(Boolean)
+              .map(url => {
+                const m = url.match(/\/browse\/([A-Za-z][A-Za-z0-9]+)-\d+/);
+                return m ? m[1] : null;
+              })
+              .filter(Boolean);
+
+            // PRESENCE-based, deliberately NOT project-scoped. "Jira Support Key" holds
+            // support-project tickets only — other projects use the separate "Jira Key"
+            // field — so ANY value here means this issue is already bridged to Jira and
+            // must not produce a second ticket.
+            //
+            // Comparing against JIRA_SUPPORT_PROJECT_KEY instead (the previous behaviour)
+            // read a key from any OTHER project as "no ticket yet", including one written
+            // by jira-agent-create-gh-issue.yml, and would also start duplicating against
+            // every pre-existing issue if the support project were ever renamed.
+            //
+            // Uses the raw value rather than the parsed prefixes on purpose: a value that
+            // fails to parse still means SOMETHING bridged this issue, so it should skip.
+            const alreadyExists = existingValue.trim() !== '';
+            core.setOutput('already_exists', String(alreadyExists));
+
+            if (alreadyExists) {
+              console.log(`Issue is already bridged to Jira (field: "${existingValue}"; parsed projects: ${existingProjects.join(', ') || 'none parsed'}) — skipping.`);
+            } else {
+              console.log(`No "Jira Support Key" value on this issue — will create in ${targetProject}.`);
+            }
+
+      - name: Create Jira Ticket
+        if: steps.external_check.outputs.is_external == 'true' && steps.check_existing.outputs.already_exists == 'false'
+        id: create_ticket
+        env:
+          JIRA_SUPPORT_PROJECT_KEY: ${{ vars.JIRA_SUPPORT_PROJECT_KEY }}
+          JIRA_ISSUE_TYPE:  ${{ steps.jira_meta.outputs.issue_type }}
+          JIRA_USER_EMAIL:  ${{ secrets.CREATE_JIRA_TICKET_USER_EMAIL }}
+          JIRA_API_TOKEN:   ${{ secrets.CREATE_JIRA_TICKET_PAT }}
+          ISSUE_TITLE:      ${{ github.event.issue.title }}
+          ISSUE_BODY:       ${{ github.event.issue.body }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg summary     "${ISSUE_TITLE}" \
+            --arg project     "${JIRA_SUPPORT_PROJECT_KEY}" \
+            --arg issuetype   "${JIRA_ISSUE_TYPE:-Story}" \
+            --arg description "${ISSUE_BODY}" \
+            '{
+              fields: {
+                project:     { key: $project },
+                summary:     $summary,
+                issuetype:   { name: $issuetype },
+                description: {
+                  type: "doc", version: 1,
+                  content: [{ type: "paragraph",
+                    content: [{ type: "text", text: $description }]
+                  }]
+                }
+              }
+            }')
+
+          RESPONSE=$(curl --silent --show-error --fail \
+            --request POST \
+            --url "${JIRA_BASE_URL}/rest/api/3/issue" \
+            --user "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" \
+            --header "Accept: application/json" \
+            --header "Content-Type: application/json" \
+            --data "$PAYLOAD")
+
+          JIRA_KEY=$(echo "$RESPONSE" | jq -r '.key // empty')
+
+          # Jira answered 2xx here - curl --fail would have aborted otherwise - but a success
+          # payload without a .key would leave this empty (or the string "null" without the
+          # `// empty` guard) and the workflow would carry on regardless: POST to
+          # /issue/null/remotelink, then write ".../browse/null" into "Jira Support Key". That
+          # value is the linkage between the two systems, so a broken one is worse than a
+          # failure - it looks correct and silently is not. Fail here instead.
+          #
+          # The payload is echoed because --silent --fail discards response bodies, so this is
+          # otherwise the one place a malformed response leaves no diagnostic trace at all.
+          if [ -z "$JIRA_KEY" ]; then
+            echo "Jira returned success but no issue key. Response body:" >&2
+            echo "$RESPONSE" >&2
+            exit 1
+          fi
+
+          echo "jira_key=$JIRA_KEY" >> "$GITHUB_OUTPUT"
+          echo "✅ Created Jira ticket: $JIRA_KEY"
+
+      - name: Add GitHub issue link to Jira ticket
+        if: steps.external_check.outputs.is_external == 'true' && steps.check_existing.outputs.already_exists == 'false'
+        env:
+          JIRA_USER_EMAIL: ${{ secrets.CREATE_JIRA_TICKET_USER_EMAIL }}
+          JIRA_API_TOKEN:  ${{ secrets.CREATE_JIRA_TICKET_PAT }}
+          JIRA_KEY:        ${{ steps.create_ticket.outputs.jira_key }}
+          ISSUE_URL:       ${{ github.event.issue.html_url }}
+          ISSUE_TITLE:     ${{ github.event.issue.title }}
+          ISSUE_NUMBER:    ${{ github.event.issue.number }}
+        run: |
+          curl --silent --show-error --fail \
+            --request POST \
+            --url "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_KEY}/remotelink" \
+            --user "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" \
+            --header "Accept: application/json" \
+            --header "Content-Type: application/json" \
+            --data "$(jq -n \
+              --arg url   "${ISSUE_URL}" \
+              --arg title "GitHub Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}" \
+              '{
+                object: {
+                  url:   $url,
+                  title: $title,
+                  icon: {
+                    url16x16: "https://github.com/favicon.ico",
+                    title:    "GitHub"
+                  }
+                }
+              }'
+            )"
+          echo "✅ Remote link added to Jira ticket"
+
+      - name: Append Jira URL to issue "Jira Support Key" field
+        if: steps.external_check.outputs.is_external == 'true' && steps.check_existing.outputs.already_exists == 'false'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          FIELD_ID:       ${{ steps.check_existing.outputs.field_id }}
+          EXISTING_VALUE: ${{ steps.check_existing.outputs.existing_value }}
+        with:
+          script: |
+            const jiraKey     = '${{ steps.create_ticket.outputs.jira_key }}';
+            const jiraUrl     = `${process.env.JIRA_BASE_URL}/browse/${jiraKey}`;
+            const issueNodeId = context.payload.issue.node_id;
+            const fieldId     = process.env.FIELD_ID;
+            const existing    = process.env.EXISTING_VALUE || '';
+
+            // Append the new ticket URL, comma-separated, preserving any existing entries.
+            const newValue = existing ? `${existing},${jiraUrl}` : jiraUrl;
+
+            await github.graphql(`
+              mutation($issueId: ID!, $fieldId: ID!, $value: String!) {
+                updateIssueFieldValue(input: {
+                  issueId:    $issueId,
+                  issueField: { fieldId: $fieldId, textValue: $value }
+                }) {
+                  issue { id }
+                }
+              }
+            `, { issueId: issueNodeId, fieldId, value: newValue });
+
+            console.log(`✅ "Jira Support Key" field set to: ${newValue}`);
+
+      # Runs even when earlier steps skipped or failed, because a skip is now the NORMAL
+      # outcome here (internal author, or already bridged) and a green run with no
+      # explanation is the thing that makes these workflows hard to trust. always() also
+      # means a failed run still says how far it got.
+      - name: Job summary
+        if: always()
+        env:
+          IS_EXTERNAL:   ${{ steps.external_check.outputs.is_external }}
+          ALREADY:       ${{ steps.check_existing.outputs.already_exists }}
+          EXISTING:      ${{ steps.check_existing.outputs.existing_value }}
+          ISSUE_TYPE:    ${{ steps.jira_meta.outputs.issue_type }}
+          JIRA_KEY:      ${{ steps.create_ticket.outputs.jira_key }}
+          AUTHOR_LOGIN:  ${{ github.event.issue.user.login }}
+          ASSOCIATION:   ${{ github.event.issue.author_association }}
+          ISSUE_NUM:     ${{ github.event.issue.number }}
+          ISSUE_URL:     ${{ github.event.issue.html_url }}
+        run: |
+          {
+            echo "## External issue → Jira support triage"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| GitHub issue | [#${ISSUE_NUM}](${ISSUE_URL}) |"
+            echo "| Author | \`${AUTHOR_LOGIN}\` (association \`${ASSOCIATION:-unknown}\`) |"
+            if [ -z "$IS_EXTERNAL" ]; then
+              echo "| Outcome | **failed** — could not determine whether the author is external; see step log |"
+            elif [ "$IS_EXTERNAL" != "true" ]; then
+              echo "| Outcome | **skipped** — author is not an external submitter |"
+            elif [ "$ALREADY" = "true" ]; then
+              echo "| Existing linkage | \`${EXISTING}\` |"
+              echo "| Outcome | **skipped** — issue is already bridged to Jira |"
+            elif [ -n "$JIRA_KEY" ]; then
+              echo "| Jira ticket | [${JIRA_KEY}](${JIRA_BASE_URL}/browse/${JIRA_KEY}) |"
+              echo "| Issue type | ${ISSUE_TYPE:-(none)} |"
+              echo "| Outcome | **created** |"
+            else
+              echo "| Outcome | **no ticket created** — author was external and not already bridged, so a later step failed; see step log |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
