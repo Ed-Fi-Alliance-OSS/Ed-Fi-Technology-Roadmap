@@ -5,10 +5,13 @@ name: Jira ticket → GitHub issue (product backlog)
 # it is bridging via the jira_key input; this workflow is a thin receiver that:
 #   - skips as a no-op if the Jira ticket already links to an issue in this repo, then
 #   - creates the issue ATOMICALLY with the body + native issue Type + Priority + labels +
-#     the "Jira Support Key" field all set in a single GraphQL createIssue mutation, then
+#     the Jira linkage field all set in a single GraphQL createIssue mutation, then
 #   - writes a Jira remote (web) link back (best-effort, de-duplicated by globalId).
-# Setting the Jira Support Key in the same mutation that creates the issue means the
-# issue can never exist without its Jira linkage (no create-then-set window, no orphan).
+# The linkage field depends on the source Jira project: tickets from the support project
+# (vars.JIRA_SUPPORT_PROJECT_KEY, e.g. EDFI) set "Jira Support Key"; every other project sets
+# "Jira Key" instead, matching the convention the GitHub->Jira workflows already use. Setting
+# it in the same mutation that creates the issue means the issue can never exist without its
+# Jira linkage (no create-then-set window, no orphan).
 # Labels go in that same mutation as label IDs, which also makes it impossible for this
 # workflow to create a label that does not already exist.
 #
@@ -76,6 +79,9 @@ jobs:
           INPUT_BODY: ${{ inputs.body }}
           INPUT_JIRA_KEY: ${{ inputs.jira_key }}
           INPUT_LABELS: ${{ inputs.labels }}
+          # Defines "the support project" for field routing (see step 3b below). Same variable
+          # github-to-jira-for-support-triage.yml already uses for the same purpose.
+          JIRA_SUPPORT_PROJECT_KEY: ${{ vars.JIRA_SUPPORT_PROJECT_KEY }}
           # Jira credentials, used both to check for an existing link and to write the
           # remote (web) link back onto the ticket. JIRA_BASE_URL is inherited from the
           # workflow-level env above.
@@ -89,6 +95,7 @@ jobs:
             const labelsInput = process.env.INPUT_LABELS || '';
 
             const SUPPORT_FIELD_NAME = 'Jira Support Key';
+            const DEV_FIELD_NAME = 'Jira Key';
             const PRIORITY_FIELD_NAME = 'Priority';
             const TITLE_MAX = 256;   // GitHub's hard cap on issue titles
 
@@ -176,7 +183,8 @@ jobs:
             // form keeps the group and the logic in agreement. Jira keys are upper-case at
             // source, so a caller sending anything else has a bug worth failing loudly on.
             const jiraKey = process.env.INPUT_JIRA_KEY || '';
-            if (!/^[A-Z][A-Z0-9]+-\d+$/.test(jiraKey)) {
+            const jiraKeyMatch = jiraKey.match(/^([A-Z][A-Z0-9]+)-\d+$/);
+            if (!jiraKeyMatch) {
               core.setFailed(
                 `The "jira_key" input (${JSON.stringify(jiraKey)}) is not a canonical Jira ` +
                 `issue key like "DMS-123". It must be upper-case with no surrounding ` +
@@ -184,6 +192,22 @@ jobs:
                 `is keyed on this value exactly as supplied.`);
               return;
             }
+            const projectKey = jiraKeyMatch[1];
+
+            // 3b. Decide which GitHub issue field carries the Jira linkage ---------------
+            // "Jira Support Key" is reserved for the support project (the same project
+            // github-to-jira-for-support-triage.yml defines via this same variable); every
+            // other project uses "Jira Key" instead, matching the convention
+            // github-to-jira-dev-backlog.yml already follows in the other direction. Failing
+            // fast on a missing variable avoids silently misrouting every dispatch to one
+            // field or the other with no signal anything is wrong.
+            const supportProjectKey = (process.env.JIRA_SUPPORT_PROJECT_KEY || '').trim();
+            if (!supportProjectKey) {
+              core.setFailed('JIRA_SUPPORT_PROJECT_KEY variable is not set.');
+              return;
+            }
+            const TARGET_FIELD_NAME =
+              projectKey === supportProjectKey ? SUPPORT_FIELD_NAME : DEV_FIELD_NAME;
 
             // 4. Jira connection details (shared by the duplicate check in step 5 and the
             //    remote-link write in step 9). JIRA_BASE_URL is a hard-coded constant in the
@@ -271,16 +295,17 @@ jobs:
             const typeNodes = meta.repository.issueTypes.nodes || [];
             const fieldNodes = meta.repository.issueFields.nodes || [];
 
-            // Support Key is linkage-critical: if the field is missing there is nowhere to
-            // record the ticket, so fail fast BEFORE creating anything (no orphan possible).
-            const supportField = fieldNodes.find(n => n.name === SUPPORT_FIELD_NAME);
-            if (!supportField) {
+            // The target field (Support Key or Key, resolved above) is linkage-critical: if
+            // it is missing there is nowhere to record the ticket, so fail fast BEFORE
+            // creating anything (no orphan possible).
+            const targetField = fieldNodes.find(n => n.name === TARGET_FIELD_NAME);
+            if (!targetField) {
               core.setFailed(
-                `"${SUPPORT_FIELD_NAME}" issue field not found. Available: ` +
+                `"${TARGET_FIELD_NAME}" issue field not found. Available: ` +
                 fieldNodes.map(n => n.name).filter(Boolean).join(', '));
               return;
             }
-            const supportFieldId = supportField.id;
+            const targetFieldId = targetField.id;
 
             // Type + Priority are best-effort: resolve if present, warn (do not fail) if not.
             let issueTypeId = null;
@@ -352,7 +377,7 @@ jobs:
             // 8. Create the issue ATOMICALLY: body + Support Key + Type + Priority
             //    + labels all in one mutation. The issue cannot exist without its Jira
             //    Support Key, so there is no create-then-set window and no orphan.
-            const issueFields = [{ fieldId: supportFieldId, textValue: jiraUrl }];
+            const issueFields = [{ fieldId: targetFieldId, textValue: jiraUrl }];
             if (priorityFieldId && priorityOptionId) {
               issueFields.push({ fieldId: priorityFieldId, singleSelectOptionId: priorityOptionId });
             }
@@ -366,7 +391,7 @@ jobs:
               }`, { input });
             const issue = createRes.createIssue.issue;
             core.info(`Created issue #${issue.number}: ${issue.url}`);
-            core.info(`Set "${SUPPORT_FIELD_NAME}" = ${jiraUrl} (atomic)`);
+            core.info(`Set "${TARGET_FIELD_NAME}" = ${jiraUrl} (atomic)`);
             if (issueTypeId) core.info(`Set issue type = ${typeName} (atomic)`);
             if (priorityOptionId) core.info(`Set Priority = ${priorityName} (atomic)`);
             if (labelIds.length) core.info(`Applied labels: ${labelSummary} (atomic)`);
@@ -422,7 +447,7 @@ jobs:
                 `Type: ${issueTypeId ? typeName : '(none)'}`,
                 `Priority: ${priorityOptionId ? priorityName : '(none)'}`,
                 `Labels: ${labelSummary}`,
-                `${SUPPORT_FIELD_NAME}: ${jiraUrl}`,
+                `${TARGET_FIELD_NAME}: ${jiraUrl}`,
                 `Jira remote link: ${remoteLinkStatus}`,
               ])
               .write();
