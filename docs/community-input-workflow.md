@@ -31,9 +31,10 @@
 | Community Hub (`community.ed-fi.org`) | Ed-Fi Community team, on Salesforce | Case submission, deflection, member content | Authenticated members |
 | Jira Cloud — `EDFI` space | Ed-Fi staff, MSDF IT admin | Customer Success daily Kanban | None |
 | Jira Cloud — team spaces | Ed-Fi staff, MSDF IT admin | Engineering backlog, four teams | None; Data Standard space is public read-only |
-| GitHub Issues — `Ed-Fi-Technology-Roadmap` | Ed-Fi technical staff | Public product backlog, releases | Read and comment anonymously/with GitHub account; cannot create |
-| GitHub Projects (boards 1 and 2) | Ed-Fi technical staff | Public roadmap views by product and by quarter | Anonymous read |
-| Slack | Ed-Fi technical staff | Informal community conversation | Separate accounts, unlinked to Salesforce |
+| GitHub Issues — `Ed-Fi-Technology-Roadmap` | Ed-Fi product team | Public product backlog, releases | Read and comment anonymously/with GitHub account; cannot create |
+| GitHub Projects (boards 1 and 2) | Ed-Fi product team | Public roadmap views by product and by quarter | Anonymous read |
+| GitHub Discussions | Ed-Fi product team | Public discussion on draft RFCs for the Data Standard | Public |
+| Slack | Shared | Informal community conversation | Separate accounts, unlinked to Salesforce |
 | `docs.ed-fi.org` | Ed-Fi | Technical documentation; the bulk of public search traffic | Anonymous |
 | Fiona (Perplexity-based assistant) | Ed-Fi | Answers member questions; sources restricted by domain | Public |
 
@@ -79,14 +80,18 @@ Community input enters through one of several unconnected channels:
    account.
 2. GitHub Projects boards 1 and 2 present the public roadmap, organized by product and by quarter,
    viewable anonymously with no sign-in.
+3. Data Standard changes become public RFC documents, posted as GitHub Discussions. The RFC is more
+   formal than the writeup in the product backlog. "Discussions" are basically the same as "Issues"
+   in GitHu, but presented in a different location within GitHub and with different workflow
+   optimizations.
 
 ### 3.5 Assistant and documentation
 
 1. `docs.ed-fi.org` hosts public technical documentation and carries the bulk of public search
    traffic.
 2. Fiona, the Ed-Fi AI assistant (built on Perplexity), answers member questions from an index
-    restricted to sources under specific domains: `www.ed-fi.org` and `docs.ed-fi.org`.
-    `github.com` is not among its indexed sources.
+   restricted to sources under specific domains: `www.ed-fi.org` and `docs.ed-fi.org`.
+   `github.com` is not among its indexed sources.
 
 ### 3.6 Slack capture
 
