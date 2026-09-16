@@ -333,14 +333,18 @@ case. The case remains the private channel for diagnostic detail and case-specif
 ### 3.7 Discoverability (FR-FIND)
 
 - **FR-FIND-1** — Roadmap content SHALL be retrievable by the Ed-Fi AI assistant's knowledge base.
-- **FR-FIND-2** — Because the assistant restricts sources by domain, publicly visible roadmap content
-  SHALL be reachable under an `ed-fi.org` domain, either natively or by scheduled export, and SHALL
-  be refreshed at least weekly and after any material roadmap change.
-- **FR-FIND-3** — Every published item SHALL have a stable, shareable URL that staff can paste into
+- **FR-FIND-2** — Every published item SHALL have a stable, shareable URL that staff can paste into
   Slack, email, governance decks, and support responses.
-- **FR-FIND-4** — Published items SHOULD be indexable by public web search engines.
-- **FR-FIND-5** — A member SHOULD be able to determine whether a problem is already known, planned,
+- **FR-FIND-3** — Published items SHOULD be indexable by public web search engines.
+- **FR-FIND-4** — A member SHOULD be able to determine whether a problem is already known, planned,
   or released without contacting a staff member.
+
+> [!WARNING]
+> Today, the AI assistant (Fiona) sources content by domain, with access to all web pages within that domain.
+> For this reason, a roadmap embedded in GitHub or edfi.atlassian.net will not be accessible to the knowledge
+> assistant: it _must not_ attempt to reference those entire web sites. The future state will need to solve
+> for FR-FIND-1 while dealing with this limitation, or the fundamental architecture of the AI assistant will
+> need to change.
 
 ### 3.8 Identity and onboarding (FR-ID)
 
