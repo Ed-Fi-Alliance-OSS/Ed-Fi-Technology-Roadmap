@@ -254,20 +254,28 @@ optional.
 - **FR-PUB-8** — Publication SHALL be reversible: staff SHALL be able to unpublish or withdraw an
   item, with the action recorded.
 
-### 3.3 Participation (FR-PART)
+### 3.3 Public Item Participation (FR-PART)
+
+This subsection applies only to items that have passed the publication gate and are visible in the
+public product backlog. It does not make support cases public and does not define access to private
+case details. A support case may be the private source for a separate public item, but staff must
+create that public item deliberately and may edit, redact, or rewrite the source material first.
+Comments, support registrations, and follows belong to the public item, not to the private support
+case. The case remains the private channel for diagnostic detail and case-specific communication.
 
 - **FR-PART-1** — An authenticated community member SHALL be able to comment on any published item.
 - **FR-PART-2** — A member SHALL be able to register support for an item in a way that can be
   counted and used in prioritization.
 - **FR-PART-3** — A member SHOULD be able to follow an item and be notified when its status changes.
-- **FR-PART-4** — The member who originated an item SHALL be notified when the resulting published
+- **FR-PART-4** — When a private support case or other private submission results in a published
+  item, the original reporter SHOULD be notified through the private channel when that published
   item is Accepted, Rejected, or Done, without a staff member having to remember to tell them.
 - **FR-PART-5** — Participation SHOULD be achievable with a credential the member already holds. The
   acceptable credential is an unresolved decision; see OQ-1.
 - **FR-PART-6** — Public discussion SHALL be moderatable: staff SHALL be able to hide or remove
   content and, where the platform allows, restrict a participant, in support of the Ed-Fi Contributor
   Code of Conduct.
-- **FR-PART-7** — Read access SHALL never be gated behind the participation credential. The
+- **FR-PART-7** — Read access to published items SHALL never be gated behind the participation credential. The
   read-only majority must not be made to pay the participation tax.
 
 ### 3.4 Lifecycle and system of record (FR-LIFE)
@@ -675,6 +683,8 @@ One vendor, one fewer hop, and native linkage to the engineering backlog.
 - **MSDF** — the Michael & Susan Dell Foundation, of which the Ed-Fi Alliance is a program.
 - **Product backlog** — the curated, community-facing set of ideas and defects, currently GitHub
   Issues. Distinct from the engineering backlog.
+- **Private support case** — a member-specific CRM record used for private details, diagnosis, and
+  case communication. It is not itself a public product-backlog item.
 - **Published item** — an item that has passed the staff gate and is publicly visible.
 - **Rovo agent** — the custom Atlassian agent that copies a Jira work item out to GitHub.
 - **SEA** — State Education Agency.
