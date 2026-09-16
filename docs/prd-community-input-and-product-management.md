@@ -190,9 +190,10 @@ hardest requirement that prior alternatives failed.
 - **Creation-time only.** All four automations copy at a moment in time. Later edits to the problem
   definition do not cascade; a reader of the derived item may be reading a stale description with no
   indication that it is stale.
-- **Comments never cross.** A community member commenting on a GitHub Issue is not visible to the
-  team working the Jira ticket, and a Salesforce case conversation is not visible to anyone outside
-  Salesforce. This is the most direct cause of the "falls through the cracks" failure mode.
+- **Comments never cross.** A community member comment on a GitHub Issue is not visible to the team working
+  the Jira ticket without opening the GitHub Issue. Salesforce comments _do_ sync into the `EDFI` ticket in
+  Jira, but there is no synchronization of Jira comments back to Salesforce. These are the most direct causes
+  of the "falls through the cracks" failure mode.
 - **The community cannot originate anything.** Issue creation is staff-only and blank issues are
   disabled; the templates route the public back to the Community Hub. Every community idea reaches
   the public backlog only by staff transcription.
