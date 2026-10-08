@@ -87,7 +87,14 @@ jobs:
           # workflow-level env above.
           JIRA_USER_EMAIL: ${{ secrets.CREATE_JIRA_TICKET_USER_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.CREATE_JIRA_TICKET_PAT }}
+          # Org-level Projects write, used ONLY for the roadmap board add (see
+          # addToRoadmapBoard). GITHUB_TOKEN cannot write an organization project.
+          PROJECT_WRITE_TOKEN: ${{ secrets.GH_PROJECT_WRITE }}
         with:
+          # Never write a ${{ }} expression anywhere inside this script, comments included.
+          # One expression makes GitHub evaluate the whole script as an expression, which is
+          # capped at 21,000 characters (the script is already past that) and splices the value
+          # into the code unescaped. Pass values through env above instead.
           script: |
             const { owner, repo } = context.repo;
 
@@ -98,6 +105,57 @@ jobs:
             const DEV_FIELD_NAME = 'Jira Key';
             const PRIORITY_FIELD_NAME = 'Priority';
             const TITLE_MAX = 256;   // GitHub's hard cap on issue titles
+
+            // The Product Roadmap board (organization project #2), as a ProjectV2 node id.
+            // Hardcoded for the same reason JIRA_BASE_URL is: it does not differ between the
+            // repos this workflow runs in - the sandbox deliberately targets the live board -
+            // so making it a variable would only add a per-repo value to provision and get
+            // wrong. A board move becomes a visible one-line diff here rather than an
+            // invisible settings change.
+            // The node id is used rather than the project NUMBER because a node id survives
+            // both renaming and renumbering of the board, and because resolving a number to
+            // an id would mean an extra query on every dispatch to look up something that
+            // changes about once a year.
+            // Set to '' to disable board membership entirely (see addToRoadmapBoard).
+            const ROADMAP_PROJECT_NODE_ID = 'PVT_kwDOA70REM4Aq1V8';
+
+            // Add an issue to the Product Roadmap board. BEST-EFFORT BY CONTRACT: every
+            // caller runs AFTER the issue exists and its Jira linkage field is already
+            // committed by the atomic create, so a board failure must never fail the run -
+            // the same contract the Jira remote link in step 9 follows. Returns a status
+            // string for the job summary.
+            //
+            // This call alone runs on a SECOND client authenticated as GH_PROJECT_WRITE:
+            // GITHUB_TOKEN was tried first and refused ("Resource not accessible by
+            // integration", AI-220), because it can only be granted repo-scoped permissions
+            // and the board is organization-owned. Everything else, the create included,
+            // stays on GITHUB_TOKEN - see step 8b for why that matters. getOctokit is the
+            // supported v9 way to build the client (precedent: github-to-jira-dev-backlog.yml).
+            const addToRoadmapBoard = async (issueNodeId) => {
+              if (!ROADMAP_PROJECT_NODE_ID) {
+                core.info('No roadmap board configured; skipping board membership.');
+                return '(skipped - no board configured)';
+              }
+              if (!process.env.PROJECT_WRITE_TOKEN) {
+                core.warning('GH_PROJECT_WRITE secret is not set; skipping board membership.');
+                return '(skipped - GH_PROJECT_WRITE not set)';
+              }
+              try {
+                const projectClient = getOctokit(process.env.PROJECT_WRITE_TOKEN);
+                const res = await projectClient.graphql(`
+                  mutation($projectId: ID!, $contentId: ID!) {
+                    addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                      item { id }
+                    }
+                  }`, { projectId: ROADMAP_PROJECT_NODE_ID, contentId: issueNodeId });
+                const itemId = res.addProjectV2ItemById.item.id;
+                core.info(`Added to the roadmap board (item ${itemId}).`);
+                return `added (item ${itemId})`;
+              } catch (err) {
+                core.warning(`Could not add the issue to the roadmap board: ${err.message}`);
+                return `FAILED (${err.message})`;
+              }
+            };
 
             // 1. Validate title -------------------------------------------------------
             if (!title) {
@@ -174,7 +232,7 @@ jobs:
             // agent knows exactly which ticket it is bridging, so there is nothing to infer.
             //
             // The raw input is validated AS GIVEN — deliberately not trimmed or upper-cased
-            // first. The job's concurrency group is keyed on ${{ inputs.jira_key }}, and
+            // first. The job's concurrency group is keyed on inputs.jira_key, and
             // Actions expressions have no case function, so the group cannot be normalized to
             // match. Normalizing here instead would mean "dms-123", "DMS-123" and " DMS-123 "
             // land in three DIFFERENT concurrency groups while all resolving to the same
@@ -255,12 +313,40 @@ jobs:
                     .map(l => l && l.object && l.object.url)
                     .find(u => typeof u === 'string' && u.startsWith(issueUrlPrefix));
                   if (alreadyLinked) {
-                    core.info(`${jiraKey} already links to ${alreadyLinked}; nothing to do.`);
+                    core.info(`${jiraKey} already links to ${alreadyLinked}; nothing to create.`);
+
+                    // Assert board membership for the issue that already exists, rather than
+                    // returning immediately. Board placement is best-effort and can therefore
+                    // fail silently on the run that created the issue; re-dispatching the
+                    // ticket is the repair path for that, and this is what makes it one.
+                    // Adding content already on the board is a no-op that returns the existing
+                    // item, so this is safe to run on every repeat dispatch.
+                    let boardStatus = '(not attempted)';
+                    const linkedNumber = Number(
+                      (alreadyLinked.match(/\/issues\/(\d+)$/) || [])[1]);
+                    if (Number.isInteger(linkedNumber)) {
+                      try {
+                        const existing = await github.rest.issues.get({
+                          owner, repo, issue_number: linkedNumber,
+                        });
+                        boardStatus = await addToRoadmapBoard(existing.data.node_id);
+                      } catch (err) {
+                        boardStatus = `FAILED (${err.message})`;
+                        core.warning(
+                          `Could not resolve issue #${linkedNumber} to assert board ` +
+                          `membership: ${err.message}`);
+                      }
+                    } else {
+                      boardStatus = '(skipped - could not parse issue number from link)';
+                      core.warning(`Could not parse an issue number from ${alreadyLinked}.`);
+                    }
+
                     await core.summary
                       .addHeading('Jira → GitHub issue skipped (already linked)', 2)
                       .addList([
                         `Jira ticket: ${jiraKey}`,
                         `Existing issue: ${alreadyLinked}`,
+                        `Roadmap board: ${boardStatus}`,
                       ])
                       .write();
                     return;
@@ -396,6 +482,17 @@ jobs:
             if (priorityOptionId) core.info(`Set Priority = ${priorityName} (atomic)`);
             if (labelIds.length) core.info(`Applied labels: ${labelSummary} (atomic)`);
 
+            // 8b. Add the issue to the Product Roadmap board (best-effort).
+            // Placed AFTER the create, never inside it: CreateIssueInput does accept
+            // projectV2Ids, which would make board membership atomic too, but that requires
+            // the whole createIssue call to run on a PAT. The loop guard in
+            // github-to-jira-dev-backlog.yml holds only because creation runs as
+            // GITHUB_TOKEN - GitHub does not re-trigger workflows for GITHUB_TOKEN-caused
+            // events - so creating under a PAT would let the labels applied above re-trigger
+            // that workflow and push this Jira-origin ticket back into Jira as a duplicate.
+            // Its sender.type == 'Bot' guard does not catch a PAT owned by a human account.
+            const boardStatus = await addToRoadmapBoard(issue.id);
+
             // 9. Write a Jira remote (web) link back to the GitHub issue (best-effort).
             // Provides the Jira → GitHub direction (the field is GitHub → Jira), is how the
             // created issue's URL reaches Jira, and is the marker step 5 reads to detect an
@@ -449,5 +546,6 @@ jobs:
                 `Labels: ${labelSummary}`,
                 `${TARGET_FIELD_NAME}: ${jiraUrl}`,
                 `Jira remote link: ${remoteLinkStatus}`,
+                `Roadmap board: ${boardStatus}`,
               ])
               .write();
